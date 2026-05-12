@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>内容安全考勤系统</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">Content Security Lab · BS Attendance</div>
+      <h1>班级智能考勤系统</h1>
+    </div>
+    <div class="userbox">
+      <span id="currentUser">未登录</span>
+      <button id="logoutBtn" class="ghost hidden">退出</button>
+    </div>
+  </header>
+
+  <main id="loginPanel" class="login-panel">
+    <section class="login-card">
+      <h2>登录</h2>
+      <p>教师默认账号：<code>teacher / teacher123</code>；学生演示账号：<code>student01 / student123</code>。</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required /></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required /></label>
+        <button type="submit">进入系统</button>
+      </form>
+      <p id="loginMsg" class="message"></p>
+    </section>
+  </main>
+
+  <main id="appPanel" class="app hidden">
+    <nav class="tabs">
+      <button data-tab="dashboard" class="active">总览</button>
+      <button data-tab="attendance">考勤打卡</button>
+      <button data-tab="records">考勤记录</button>
+      <button data-tab="students" data-teacher>学生/人脸库</button>
+      <button data-tab="group" data-teacher>合照识别</button>
+      <button data-tab="stats">统计报表</button>
+      <button data-tab="security" data-teacher>安全自测</button>
+      <button data-tab="scorecard">验收清单</button>
+    </nav>
+
+    <section id="dashboard" class="tab active">
+      <div class="section-head">
+        <h2>系统总览</h2>
+        <p>覆盖 BS 架构、摄像头采集、动作活体、人脸库匹配、合照识别、情绪统计、权限控制与异常处理。</p>
+      </div>
+      <div id="summaryCards" class="cards"></div>
+      <div class="notice">
+        <strong>验收建议：</strong>先在“学生/人脸库”中为学生上传 3–5 张正脸样本，再进行摄像头打卡和合照识别演示。
+      </div>
+    </section>
+
+    <section id="attendance" class="tab">
+      <div class="section-head">
+        <h2>基础考勤</h2>
+        <p>浏览器调用摄像头，按随机动作挑战采集多帧，后端完成活体检测、人脸识别与情绪记录。</p>
+      </div>
+      <div class="camera-grid">
+        <div class="camera-card">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="captureCanvas" class="hidden"></canvas>
+          <div class="actions">
+            <button id="startCameraBtn">开启摄像头</button>
+            <button id="manualCaptureBtn" class="ghost">手动抓拍预检</button>
+            <button id="startCheckBtn">开始活体打卡</button>
+          </div>
+        </div>
+        <div class="status-card">
+          <h3>采集状态</h3>
+          <ol id="challengeSteps" class="steps"></ol>
+          <div id="attendanceMsg" class="result-box">等待采集</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="records" class="tab">
+      <div class="section-head">
+        <h2>考勤记录</h2>
+        <p>支持按日期、学号筛选；教师可导出 Excel，学生只能查看本人记录。</p>
+      </div>
+      <form id="recordFilter" class="toolbar">
+        <input name="student_no" placeholder="学号" />
+        <input name="start" type="date" />
+        <input name="end" type="date" />
+        <button type="submit">查询</button>
+        <a class="button ghost" href="/api/attendance/export" target="_blank">导出 Excel</a>
+      </form>
+      <div class="table-wrap"><table id="recordTable"></table></div>
+    </section>
+
+    <section id="students" class="tab">
+      <div class="section-head">
+        <h2>学生管理与人脸库</h2>
+        <p>教师可新增学生、维护人脸样本；每名学生建议至少上传 3 张不同光照/角度照片。</p>
+      </div>
+      <form id="studentForm" class="student-form">
+        <input name="student_no" placeholder="学号" required />
+        <input name="name" placeholder="姓名" required />
+        <input name="class_name" placeholder="班级" />
+        <input name="gender" placeholder="性别" />
+        <button type="submit">新增学生</button>
+      </form>
+      <details class="subpanel">
+        <summary>批量导入学生（JSON）</summary>
+        <p class="small">格式示例：<code>[{"student_no":"20260003","name":"王五","class_name":"内容安全实践班"}]</code></p>
+        <textarea id="bulkStudentsInput" rows="5" placeholder='[{"student_no":"20260003","name":"王五","class_name":"内容安全实践班"}]'></textarea>
+        <button id="bulkStudentsBtn">批量导入/更新</button>
+      </details>
+      <details class="subpanel">
+        <summary>摄像头采集人脸样本</summary>
+        <p class="small">选择学生后，可用当前摄像头画面直接入库，方便现场没有照片文件时演示。</p>
+        <div class="toolbar">
+          <select id="cameraStudentSelect"></select>
+          <button id="addFaceFromCameraBtn">从摄像头入库</button>
+        </div>
+      </details>
+      <div class="toolbar">
+        <input id="studentSearch" placeholder="搜索学号/姓名/班级" />
+        <button id="reloadStudentsBtn">刷新</button>
+      </div>
+      <div id="faceSamplesPanel" class="subpanel hidden"></div>
+      <div class="table-wrap"><table id="studentTable"></table></div>
+    </section>
+
+    <section id="group" class="tab">
+      <div class="section-head">
+        <h2>合照学生识别</h2>
+        <p>上传活动合照，后端批量检测人脸、匹配人脸库、记录参与频次并同步情绪分析。</p>
+      </div>
+      <form id="groupForm" class="upload-card">
+        <input name="title" placeholder="活动名称，如：课程实验验收" />
+        <input name="photo" type="file" accept="image/*" required />
+        <button type="submit">识别合照</button>
+      </form>
+      <div id="groupResult" class="group-result"></div>
+    </section>
+
+    <section id="stats" class="tab">
+      <div class="section-head">
+        <h2>统计报表</h2>
+        <p>活动参与频次、情绪分布统计，以表格和轻量柱状图展示。</p>
+      </div>
+      <div class="stats-grid">
+        <div class="panel"><h3>活动参与频次</h3><div id="activityStats"></div></div>
+        <div class="panel"><h3>情绪分布</h3><div id="emotionStats"></div></div>
+      </div>
+    </section>
+
+    <section id="security" class="tab">
+      <div class="section-head">
+        <h2>安全自测</h2>
+        <p>用于现场证明抗伪造能力：静态照片/重复帧会被后端活体检测拒绝，随机挑战可抵御预录视频。</p>
+      </div>
+      <div class="camera-grid">
+        <div class="panel">
+          <h3>照片/重复帧攻击自测</h3>
+          <p class="small">先开启考勤页摄像头，或者在此点击开启；系统截取一帧并复制成多阶段帧，模拟静态照片攻击。</p>
+          <div class="actions">
+            <button id="securityCameraBtn">开启摄像头</button>
+            <button id="staticAttackBtn">运行静态照片攻击自测</button>
+            <button id="sampleAttackBtn" class="ghost">无摄像头样本攻击自测</button>
+            <button id="randomnessBtn" class="ghost">展示随机挑战抗视频</button>
+          </div>
+        </div>
+        <div id="securityResult" class="result-box">等待测试</div>
+      </div>
+    </section>
+
+    <section id="scorecard" class="tab">
+      <div class="section-head">
+        <h2>验收清单</h2>
+        <p>把评分标准逐项映射到页面、接口和证据，现场按这个顺序展示即可。</p>
+      </div>
+      <div class="toolbar">
+        <button id="reloadScorecardBtn">刷新清单</button>
+        <a class="button ghost" href="/api/reports/scorecard" target="_blank">下载 Markdown 清单</a>
+      </div>
+      <div id="scorecardSummary" class="cards"></div>
+      <div class="table-wrap"><table id="scorecardTable"></table></div>
+    </section>
+  </main>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
