@@ -8,6 +8,7 @@ import time
 import base64
 from pathlib import Path
 
+import numpy as np
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory, session
 from openpyxl import Workbook
 from werkzeug.security import generate_password_hash
@@ -41,14 +42,35 @@ LIVENESS_ACTION_LABELS = {
     "move_right": "向屏幕右侧移动脸部",
     "move_closer": "靠近摄像头",
     "move_away": "远离摄像头",
-    # 新增 5 个动态动作：上下移动、左右摆动、上下点头、远近变化。
-    "move_up": "向屏幕上方移动脸部",
-    "move_down": "向屏幕下方移动脸部",
-    "shake_left_right": "左右移动脸部一次",
-    "nod_up_down": "上下点头一次",
-    "zoom_in_out": "先靠近再远离摄像头",
+    # 每组只要求一个原子动作；组合动作和上下平移已移出动作池，降低现场误操作。
+    "nod": "点头一次",
+    "blink": "眨眼一次",
+    "open_mouth": "张嘴一次",
+    "turn_left": "向左转头",
+    "turn_right": "向右转头",
+    "flash_response": "保持正脸，完成多种颜色打光检测",
 }
 LIVENESS_ACTION_POOL = list(LIVENESS_ACTION_LABELS.keys())
+LIVENESS_FLASH_SEQUENCE_LENGTH = 4
+LIVENESS_FLASH_COLORS = [
+    {"name": "amber", "rgb": [255, 186, 36]},
+    {"name": "cyan", "rgb": [0, 210, 255]},
+    {"name": "red", "rgb": [255, 78, 78]},
+    {"name": "green", "rgb": [46, 229, 157]},
+    {"name": "white", "rgb": [245, 248, 255]},
+]
+
+
+def _random_flash_sequence() -> list[dict]:
+    # 每组生成独立随机颜色序列；允许颜色重复，但避免相邻两帧完全相同。
+    seq = []
+    last = None
+    for _ in range(LIVENESS_FLASH_SEQUENCE_LENGTH):
+        choices = [c for c in LIVENESS_FLASH_COLORS if c["name"] != last] or LIVENESS_FLASH_COLORS
+        item = random.choice(choices)
+        seq.append({"name": item["name"], "rgb": item["rgb"]})
+        last = item["name"]
+    return seq
 
 
 def create_app() -> Flask:
@@ -154,7 +176,7 @@ def create_app() -> Flask:
             {"module": "基础考勤", "point": "手动/自动捕捉并显示状态", "score": 3, "route": "考勤打卡：手动抓拍预检 + 开始活体打卡", "evidence": "单帧手动预检不写入考勤；3 组随机动作挑战，每组最多 5 秒，检测通过才进入下一组"},
             {"module": "基础考勤", "point": "实时渲染考勤结果", "score": 3, "route": "考勤结果框", "evidence": "姓名、学号、状态、时间、活体分、人脸分、情绪"},
             {"module": "基础考勤", "point": "筛选查询考勤记录", "score": 3, "route": "考勤记录", "evidence": "日期/学号筛选"},
-            {"module": "基础考勤", "point": "活体检测抗照片/视频", "score": 10, "route": "考勤打卡 + 安全自测", "evidence": "9 种动作池、3 组限时挑战、多帧运动、重复帧检测、挑战过期"},
+            {"module": "基础考勤", "point": "活体检测抗照片/视频", "score": 10, "route": "考勤打卡 + 安全自测", "evidence": "10 种单动作池、3 组限时挑战、多帧运动、重复帧检测、实时随机打光、挑战过期"},
             {"module": "基础考勤", "point": "人脸库批量导入和增删改", "score": 2, "route": "学生/人脸库", "evidence": "新增、编辑、删除学生；查看/删除单个人脸样本；多文件上传样本；摄像头补采样本；face_data 批量导入"},
             {"module": "基础考勤", "point": "考勤数据记录和 Excel 导出", "score": 1, "route": "考勤记录/导出 Excel", "evidence": "attendance_records.xlsx"},
             {"module": "合照识别", "point": "上传合照并批量识别人脸", "score": 3, "route": "合照识别", "evidence": "检测人脸框、逐个匹配"},
@@ -163,7 +185,7 @@ def create_app() -> Flask:
             {"module": "情绪分析", "point": "考勤/合照同步提取情绪", "score": 5, "route": "考勤结果/合照结果", "evidence": "emotion_records"},
             {"module": "情绪分析", "point": "情绪统计结果", "score": 3, "route": "统计报表", "evidence": "按 scene/emotion 聚合"},
             {"module": "系统安全", "point": "照片攻击抵御", "score": 7, "route": "安全自测/活体失败结果", "evidence": "静态帧和动作不足失败"},
-            {"module": "系统安全", "point": "视频攻击抵御", "score": 8, "route": "随机挑战+过期机制", "evidence": "固定预录视频难以匹配 9 选 3 的动作顺序、5 秒分组限时和后端逐组判定"},
+            {"module": "系统安全", "point": "视频攻击抵御", "score": 8, "route": "随机挑战+过期机制", "evidence": "固定预录视频难以匹配 10 选 3 的动作顺序、5 秒分组限时、实时随机打光和后端逐组判定"},
             {"module": "系统安全", "point": "教师/学生权限", "score": 3, "route": "教师/学生账号切换", "evidence": "学生仅可查看本人记录，教师可管理全部"},
             {"module": "报告源码", "point": "报告完整规范", "score": 20, "route": "docs/课程设计报告.docx + docs/课程设计报告.md", "evidence": "需求、系统设计、接口、算法、测试、结果、改进完整覆盖"},
             {"module": "报告源码", "point": "源码完整可部署", "score": 10, "route": "README.md", "evidence": "运行环境、部署步骤、依赖说明"},
@@ -411,10 +433,12 @@ def create_app() -> Flask:
     @require_login
     def attendance_challenge():
         actions = random.sample(LIVENESS_ACTION_POOL, LIVENESS_GROUP_COUNT)
+        flash_sequences = [_random_flash_sequence() for _ in range(LIVENESS_GROUP_COUNT)]
         now = time.time()
         challenge = {
             "id": f"ch_{int(now)}_{random.randint(1000,9999)}",
             "actions": actions,
+            "flash_sequences": flash_sequences,
             "created_at": now,
             "group_count": LIVENESS_GROUP_COUNT,
             "group_timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
@@ -428,7 +452,9 @@ def create_app() -> Flask:
                 "action": action,
                 "label": LIVENESS_ACTION_LABELS[action],
                 "timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
-                "hint": f"第 {i}/{LIVENESS_GROUP_COUNT} 组：请在 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒内完成动作，检测通过后自动进入下一组。",
+                "hint": f"第 {i}/{LIVENESS_GROUP_COUNT} 组：每组只做当前这一个动作，并在 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒内完成；检测通过后自动进入下一组；画面边缘会闪烁随机颜色用于抵御预录视频。",
+                "flash_sequence": challenge["flash_sequences"][i - 1],
+                "flash_interval_ms": 520,
             }
             for i, action in enumerate(actions, start=1)
         ]
@@ -459,7 +485,11 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "活体挑战已过期，请重新开始"}), 400
         if len(frames) < LIVENESS_GROUP_COUNT * 4:
             return jsonify({"ok": False, "error": "采集帧数不足"}), 400
-        live = analyze_liveness(frames, ch.get("actions", []))
+        challenge_steps = [
+            {"stage": i, "action": action, "flash_sequence": (ch.get("flash_sequences") or [])[i - 1] if i - 1 < len(ch.get("flash_sequences") or []) else []}
+            for i, action in enumerate(ch.get("actions", []), start=1)
+        ]
+        live = analyze_liveness(frames, ch.get("actions", []), challenge_steps=challenge_steps)
         best_img, best_face, best_quality = None, None, -1.0
         for item in frames:
             try:
@@ -555,9 +585,14 @@ def create_app() -> Flask:
                 "liveness": {"pass": False, "score": 0.0, "motion_checks": []},
             })
         action = actions[stage - 1]
+        step = {
+            "stage": stage,
+            "action": action,
+            "flash_sequence": (ch.get("flash_sequences") or [])[stage - 1] if stage - 1 < len(ch.get("flash_sequences") or []) else [],
+        }
         for frame in frames:
-            frame["stage"] = 1
-        live = analyze_liveness(frames, [action])
+            frame["stage"] = stage
+        live = analyze_liveness(frames, [action], challenge_steps=[step])
         check = (live.get("motion_checks") or [{}])[0]
         # analyze_liveness 的最终 pass 还要求整体分数；单组实时判定以该组动作检查为准。
         stage_pass = bool(check.get("ok") and live.get("seen_frames", 0) >= 3)
@@ -708,7 +743,7 @@ def create_app() -> Flask:
             for stage in range(1, LIVENESS_GROUP_COUNT + 1):
                 for _ in range(6):
                     frames.append({"stage": stage, "image": b64})
-            live = analyze_liveness(frames, ["move_left", "move_closer", "shake_left_right"])
+            live = analyze_liveness(frames, ["move_left", "blink", "flash_response"])
             with db() as conn:
                 log_action(conn, session.get("user_id"), "liveness_self_test", live)
             return jsonify({"ok": True, "attack": "static_photo_replay", "expected": "fail", "liveness": live})
@@ -735,7 +770,7 @@ def create_app() -> Flask:
                 raise ValueError("样本图片编码失败")
             b64 = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
             frames = [{"stage": stage, "image": b64} for stage in range(1, LIVENESS_GROUP_COUNT + 1) for _ in range(6)]
-            live = analyze_liveness(frames, ["move_left", "move_closer", "shake_left_right"])
+            live = analyze_liveness(frames, ["move_left", "blink", "flash_response"])
             with db() as conn:
                 log_action(conn, session.get("user_id"), "liveness_self_test_sample", {
                     "student_no": sample["student_no"],
@@ -744,6 +779,133 @@ def create_app() -> Flask:
             return jsonify({
                 "ok": True,
                 "attack": "sample_static_photo_replay",
+                "sample": {"student_no": sample["student_no"], "name": sample["name"]},
+                "expected": "fail",
+                "liveness": live,
+            })
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/liveness/self-test-moving-photo")
+    @require_role("teacher")
+    def liveness_self_test_moving_photo():
+        """构造“举着同一张照片移动”的攻击帧：人脸框按动作移动，但归一化人脸纹理几乎不变，应被拒绝。"""
+        try:
+            with db() as conn:
+                sample = conn.execute(
+                    """SELECT f.image_path,s.student_no,s.name
+                       FROM face_samples f JOIN students s ON s.id=f.student_id
+                       ORDER BY f.quality DESC LIMIT 1"""
+                ).fetchone()
+            if not sample:
+                return jsonify({"ok": False, "error": "人脸库为空，请先导入 face_data"}), 400
+            img = read_image_path(BASE_DIR / sample["image_path"])
+            import cv2
+            base_h, base_w = 720, 960
+            photo = cv2.resize(img, (260, 320), interpolation=cv2.INTER_AREA)
+            actions = ["move_left", "open_mouth", "turn_right"]
+            frames = []
+            positions = {
+                1: [(370, 200), (340, 200), (300, 200), (260, 200), (230, 200), (210, 200)],
+                2: [(350, 210, 0.92), (340, 200, 1.00), (330, 190, 1.08), (320, 180, 1.16), (310, 170, 1.24), (300, 160, 1.32)],
+                3: [(340, 200), (355, 200), (370, 200), (385, 200), (400, 200), (415, 200)],
+            }
+            for stage in range(1, 4):
+                for idx, pos in enumerate(positions[stage]):
+                    if len(pos) == 3:
+                        x, y, scale = pos
+                        patch = cv2.resize(photo, (int(photo.shape[1] * scale), int(photo.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                    else:
+                        x, y = pos
+                        patch = photo
+                    canvas = cv2.GaussianBlur(np.full((base_h, base_w, 3), 32, dtype=np.uint8), (3, 3), 0)
+                    # 模拟白纸/手机屏幕边框，便于触发平面介质特征。
+                    pad = 18
+                    x1, y1 = max(0, x - pad), max(0, y - pad)
+                    x2, y2 = min(base_w, x + patch.shape[1] + pad), min(base_h, y + patch.shape[0] + pad)
+                    canvas[y1:y2, x1:x2] = (230, 230, 230)
+                    canvas[y:y + patch.shape[0], x:x + patch.shape[1]] = patch
+                    ok, buf = cv2.imencode(".jpg", canvas)
+                    if not ok:
+                        raise ValueError("攻击帧编码失败")
+                    frames.append({
+                        "stage": stage,
+                        "stage_elapsed_ms": idx * 650,
+                        "image": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
+                    })
+            live = analyze_liveness(frames, actions)
+            with db() as conn:
+                log_action(conn, session.get("user_id"), "liveness_self_test_moving_photo", {
+                    "student_no": sample["student_no"],
+                    "liveness": live,
+                })
+            return jsonify({
+                "ok": True,
+                "attack": "moving_printed_photo",
+                "sample": {"student_no": sample["student_no"], "name": sample["name"]},
+                "expected": "fail",
+                "liveness": live,
+            })
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/liveness/self-test-prerecorded")
+    @require_role("teacher")
+    def liveness_self_test_prerecorded():
+        """构造动作正确但不带本次随机闪光响应的“预录视频”攻击，应被随机闪光校验拒绝。"""
+        try:
+            with db() as conn:
+                sample = conn.execute(
+                    """SELECT f.image_path,s.student_no,s.name
+                       FROM face_samples f JOIN students s ON s.id=f.student_id
+                       ORDER BY f.quality DESC LIMIT 1"""
+                ).fetchone()
+            if not sample:
+                return jsonify({"ok": False, "error": "人脸库为空，请先导入 face_data"}), 400
+            img = read_image_path(BASE_DIR / sample["image_path"])
+            import cv2
+            actions = ["move_left", "open_mouth", "turn_right"]
+            steps = [{"stage": i, "action": a, "flash_sequence": _random_flash_sequence()} for i, a in enumerate(actions, start=1)]
+            frames = []
+            base_h, base_w = 720, 960
+            face = cv2.resize(img, (280, 360), interpolation=cv2.INTER_AREA)
+            for stage in range(1, 4):
+                for idx in range(6):
+                    canvas = np.full((base_h, base_w, 3), 70, dtype=np.uint8)
+                    if stage == 1:
+                        x, y = 390 - idx * 26, 190
+                        scale = 1.0
+                    elif stage == 2:
+                        x, y = 340 - idx * 7, 190 - idx * 5
+                        scale = 0.92 + idx * 0.07
+                    else:
+                        x, y = 330 + idx * 16, 190
+                        scale = 1.0
+                    patch = cv2.resize(face, (int(face.shape[1] * scale), int(face.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                    x = max(0, min(base_w - patch.shape[1], int(x)))
+                    y = max(0, min(base_h - patch.shape[0], int(y)))
+                    canvas[y:y + patch.shape[0], x:x + patch.shape[1]] = patch
+                    flash_idx = idx % len(steps[stage - 1]["flash_sequence"])
+                    ok, buf = cv2.imencode(".jpg", canvas)
+                    if not ok:
+                        raise ValueError("攻击帧编码失败")
+                    frames.append({
+                        "stage": stage,
+                        "stage_elapsed_ms": idx * 650,
+                        "flash_index": flash_idx,
+                        # 故意提交正确元数据，但画面不响应随机颜色，模拟提前录好的视频。
+                        "flash_rgb": steps[stage - 1]["flash_sequence"][flash_idx]["rgb"],
+                        "image": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
+                    })
+            live = analyze_liveness(frames, actions, challenge_steps=steps)
+            with db() as conn:
+                log_action(conn, session.get("user_id"), "liveness_self_test_prerecorded", {
+                    "student_no": sample["student_no"],
+                    "liveness": live,
+                })
+            return jsonify({
+                "ok": True,
+                "attack": "prerecorded_video_without_flash_response",
                 "sample": {"student_no": sample["student_no"], "name": sample["name"]},
                 "expected": "fail",
                 "liveness": live,
@@ -785,9 +947,12 @@ def create_app() -> Flask:
                 for action in LIVENESS_ACTION_POOL
             ],
             "challenges": challenges,
+            "flash_sequence_length": LIVENESS_FLASH_SEQUENCE_LENGTH,
+            "flash_colors": LIVENESS_FLASH_COLORS,
             "explain": f"正式考勤每次从 {len(LIVENESS_ACTION_POOL)} 个动作中随机抽取 {LIVENESS_GROUP_COUNT} 组，"
                        f"每组最多 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒，检测到当前动作才进入下一组；"
-                       f"整次挑战写入 session 并 {LIVENESS_CHALLENGE_TTL_SECONDS} 秒过期。固定预录视频难以提前覆盖随机动作顺序、限时响应和实时多帧运动检查。",
+                       f"每组同步下发 {LIVENESS_FLASH_SEQUENCE_LENGTH} 段随机屏幕闪光颜色，后端校验人脸区域颜色响应。"
+                       f"整次挑战写入 session 并 {LIVENESS_CHALLENGE_TTL_SECONDS} 秒过期。固定预录视频既难提前覆盖随机动作顺序，也无法响应本次实时闪光。",
         })
 
     @app.post("/api/group/recognize")
@@ -1017,7 +1182,7 @@ def create_app() -> Flask:
             "## 兜底演示说明",
             "",
             "- 若现场摄像头权限或设备异常，可先用“安全自测 -> 无摄像头样本攻击自测”证明照片/重复帧攻击被拒绝。",
-            "- 若要展示视频重放防护逻辑，可点击“安全自测 -> 展示随机挑战抗视频”，查看 9 种动作池、3 组限时挑战、每组 5 秒上限与 90 秒过期机制。",
+            "- 若要展示视频重放防护逻辑，可点击“安全自测 -> 展示随机挑战抗视频”，查看 10 种单动作池、3 组限时挑战、每组 5 秒上限、随机打光与 90 秒过期机制。",
             "- 正式考勤仍建议使用“考勤打卡 -> 开启摄像头 -> 手动抓拍预检 -> 开始活体打卡”完整演示。",
         ]
         content = "\n".join(lines)

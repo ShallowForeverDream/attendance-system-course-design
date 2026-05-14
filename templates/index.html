@@ -58,7 +58,7 @@
     <section id="attendance" class="tab">
       <div class="section-head">
         <h2>基础考勤</h2>
-        <p>浏览器调用摄像头，按 3 组随机动作挑战采集多帧；每组最多 5 秒，检测到当前动作后才进入下一组，后端完成活体检测、人脸识别与情绪记录。</p>
+        <p>浏览器调用摄像头，按 3 组随机单动作挑战采集多帧；每组最多 5 秒，并同步随机屏幕闪光，检测到当前动作和实时光照响应后才进入下一组，后端完成活体检测、人脸识别与情绪记录。</p>
       </div>
       <div class="camera-grid">
         <div class="camera-card">
@@ -154,7 +154,7 @@
     <section id="security" class="tab">
       <div class="section-head">
         <h2>安全自测</h2>
-        <p>用于现场证明抗伪造能力：静态照片/重复帧会被后端活体检测拒绝；9 种动作池、3 组限时随机挑战可提高预录视频伪造成本。</p>
+        <p>用于现场证明抗伪造能力：静态照片、举照片移动、预录视频都会进入后端专项自测；10 种原子动作池、3 组限时随机挑战、归一化人脸微变化和随机闪光响应共同抵御伪造。</p>
       </div>
       <div class="camera-grid">
         <div class="panel">
@@ -164,6 +164,8 @@
             <button id="securityCameraBtn">开启摄像头</button>
             <button id="staticAttackBtn">运行静态照片攻击自测</button>
             <button id="sampleAttackBtn" class="ghost">无摄像头样本攻击自测</button>
+            <button id="movingPhotoAttackBtn" class="ghost">举照片移动攻击自测</button>
+            <button id="prerecordedAttackBtn" class="ghost">预录视频攻击自测</button>
             <button id="randomnessBtn" class="ghost">展示随机挑战抗视频</button>
           </div>
         </div>

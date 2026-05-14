@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,21 +12,28 @@ from typing import Iterable
 
 import cv2
 import numpy as np
-from emotiefflib.facial_analysis import EmotiEffLibRecognizer
 from PIL import Image, ImageOps
 
 from .config import ANNOTATED_DIR, FACE_MATCH_THRESHOLD
 
+try:
+    from emotiefflib.facial_analysis import EmotiEffLibRecognizer  # type: ignore
+except Exception:  # pragma: no cover - optional heavy dependency
+    EmotiEffLibRecognizer = None  # type: ignore
+
 _emotion_recognizer = None
 
 
-def _get_emotion_recognizer() -> EmotiEffLibRecognizer:
+def _get_emotion_recognizer():
+    """延迟加载队友新增的 EmotiEffLib 模型；未安装时不影响系统其它功能。"""
     global _emotion_recognizer
+    if EmotiEffLibRecognizer is None:
+        return None
     if _emotion_recognizer is None:
         _emotion_recognizer = EmotiEffLibRecognizer(
-            model_name='enet_b0_8_best_vgaf',
-            engine='onnx',
-            device='cpu',
+            model_name="enet_b0_8_best_vgaf",
+            engine="onnx",
+            device="cpu",
         )
     return _emotion_recognizer
 
@@ -171,6 +179,299 @@ def _frame_diff(a: np.ndarray, b: np.ndarray) -> float:
     ga = cv2.resize(ga, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     gb = cv2.resize(gb, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     return float(np.mean(np.abs(ga - gb)))
+
+
+def _to_float_list(values: Iterable, scale: float = 1.0) -> list[float]:
+    out = []
+    for v in values:
+        try:
+            out.append(float(v) / scale)
+        except Exception:
+            out.append(0.0)
+    return out
+
+
+def _crop_signal_features(face_img: np.ndarray) -> dict:
+    """提取活体/伪造检测用的轻量纹理与颜色响应特征。
+
+    课程前 5 次实验已经用过 HOG/LBP、频域/时频纹理、Face-X-Ray 的伪造边界思想；
+    这里不引入重模型，而是把这些思想压缩成可实时运行的特征：归一化人脸帧差、
+    高频/网格纹理、镜面高光、色彩响应。返回值只含 JSON 可序列化标量。
+    """
+    if face_img is None or face_img.size == 0:
+        return {
+            "face_rgb": [0.0, 0.0, 0.0],
+            "face_luma": 0.0,
+            "face_sat": 0.0,
+            "eye_dark": 0.0,
+            "eye_edge": 0.0,
+            "mouth_dark": 0.0,
+            "mouth_edge": 0.0,
+            "mouth_black": 0.0,
+            "mouth_open": 0.0,
+            "yaw_proxy": 0.0,
+            "face_aspect": 0.0,
+            "specular_ratio": 0.0,
+            "edge_density": 0.0,
+            "lap_var": 0.0,
+            "fft_high_ratio": 0.0,
+            "moire_score": 0.0,
+            "norm_hash": "",
+            "norm_gray": np.zeros((72, 72), dtype=np.float32),
+        }
+    h, w = face_img.shape[:2]
+    y1, y2 = int(h * 0.10), max(int(h * 0.90), int(h * 0.10) + 1)
+    x1, x2 = int(w * 0.10), max(int(w * 0.90), int(w * 0.10) + 1)
+    roi = face_img[y1:y2, x1:x2]
+    if roi.size == 0:
+        roi = face_img
+    rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+    ych, cr, cb = cv2.split(ycrcb)
+    skin_mask = (cr > 133) & (cr < 180) & (cb > 75) & (cb < 138) & (ych > 35)
+    if float(skin_mask.mean()) > 0.06:
+        pixels = rgb[skin_mask]
+    else:
+        pixels = rgb.reshape(-1, 3)
+    mean_rgb = pixels.mean(axis=0) if pixels.size else np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    specular = ((hsv[:, :, 2] > 242) & (hsv[:, :, 1] < 55)).mean()
+    sat = hsv[:, :, 1].mean() / 255.0
+    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+    norm = cv2.resize(gray, (72, 72), interpolation=cv2.INTER_AREA)
+    norm = cv2.equalizeHist(norm).astype(np.float32) / 255.0
+    bits = norm > float(norm.mean())
+    norm_hash = "".join("1" if x else "0" for x in bits[::6, ::6].ravel())
+    lap_var = min(cv2.Laplacian(gray, cv2.CV_64F).var() / 1200.0, 2.5)
+    edges = cv2.Canny(gray, 80, 160)
+    edge_density = float(edges.mean() / 255.0)
+
+    norm_face = cv2.resize(gray, (96, 120), interpolation=cv2.INTER_AREA)
+    norm_eq = cv2.equalizeHist(norm_face)
+    eye_band = norm_eq[22:54, 12:84]
+    mouth_band = norm_eq[72:108, 20:76]
+    eye_thr = float(np.percentile(eye_band, 26)) if eye_band.size else 0.0
+    mouth_thr = float(np.percentile(mouth_band, 30)) if mouth_band.size else 0.0
+    eye_dark = float((eye_band < eye_thr).mean()) if eye_band.size else 0.0
+    mouth_dark = float((mouth_band < mouth_thr).mean()) if mouth_band.size else 0.0
+    eye_edge = float(cv2.Canny(eye_band, 55, 135).mean() / 255.0) if eye_band.size else 0.0
+    mouth_edge = float(cv2.Canny(mouth_band, 45, 125).mean() / 255.0) if mouth_band.size else 0.0
+    if mouth_band.size:
+        dark_mask = mouth_band < mouth_thr
+        ys, _ = np.where(dark_mask)
+        vertical_span = (float(ys.max() - ys.min() + 1) / max(mouth_band.shape[0], 1)) if len(ys) else 0.0
+        lower_mid = norm_eq[70:112, 18:78]
+        base_mid = norm_eq[58:70, 18:78]
+        lower_dark_abs = float((lower_mid < 42).mean()) if lower_mid.size else 0.0
+        base_dark_abs = float((base_mid < 42).mean()) if base_mid.size else 0.0
+        mouth_black = max(0.0, lower_dark_abs - base_dark_abs * 0.35)
+        mouth_open = min(1.0, max(0.0, (mouth_dark - 0.18) * 1.80 + vertical_span * 0.18 + mouth_edge * 0.18 + mouth_black * 2.80))
+    else:
+        mouth_black = 0.0
+        mouth_open = 0.0
+    left_half = norm_eq[:, :48].astype(np.float32)
+    right_half = norm_eq[:, 48:].astype(np.float32)
+    yaw_proxy = float((right_half.mean() - left_half.mean()) / 255.0)
+    face_aspect = float(w / max(h, 1))
+
+    fsmall = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA).astype(np.float32)
+    spectrum = np.fft.fftshift(np.fft.fft2(fsmall - fsmall.mean()))
+    mag = np.abs(spectrum)
+    yy, xx = np.indices(mag.shape)
+    cy, cx = (np.array(mag.shape) - 1) / 2.0
+    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    total = float(mag.sum() + 1e-6)
+    high_ratio = float(mag[rr > 24].sum() / total)
+    # 屏幕翻拍/打印件常出现方向性周期峰；取高频能量峰值相对均值作为轻量摩尔纹指标。
+    ring = mag[(rr > 18) & (rr < 45)]
+    moire_score = float((np.percentile(ring, 99) / (np.mean(ring) + 1e-6)) / 60.0) if ring.size else 0.0
+    return {
+        "face_rgb": [round(float(x), 6) for x in mean_rgb.tolist()],
+        "face_luma": round(float(0.2126 * mean_rgb[0] + 0.7152 * mean_rgb[1] + 0.0722 * mean_rgb[2]), 6),
+        "face_sat": round(float(sat), 6),
+        "eye_dark": round(float(eye_dark), 6),
+        "eye_edge": round(float(eye_edge), 6),
+        "mouth_dark": round(float(mouth_dark), 6),
+        "mouth_edge": round(float(mouth_edge), 6),
+        "mouth_black": round(float(mouth_black), 6),
+        "mouth_open": round(float(mouth_open), 6),
+        "yaw_proxy": round(float(yaw_proxy), 6),
+        "face_aspect": round(float(face_aspect), 6),
+        "specular_ratio": round(float(specular), 6),
+        "edge_density": round(float(edge_density), 6),
+        "lap_var": round(float(lap_var), 6),
+        "fft_high_ratio": round(float(high_ratio), 6),
+        "moire_score": round(float(moire_score), 6),
+        "norm_hash": norm_hash,
+        "norm_gray": norm,
+    }
+
+
+def _parse_flash_rgb(value) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return None
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    rgb = _to_float_list(value[:3], scale=255.0)
+    return [max(0.0, min(1.0, x)) for x in rgb]
+
+
+def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    if a.size < 3 or b.size != a.size or float(a.std()) < 1e-6 or float(b.std()) < 1e-6:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _expected_flash_rgb(stage: int, flash_index: int | None, challenge_steps: list[dict] | None) -> list[float] | None:
+    if flash_index is None or not challenge_steps:
+        return None
+    step = next((s for s in challenge_steps if int(s.get("stage", 0)) == int(stage)), None)
+    if not step:
+        # 单组实时检测时，前端可能传 stage=N，而 analyze_liveness 只收到一个 step。
+        step = challenge_steps[0] if len(challenge_steps) == 1 else None
+    seq = (step or {}).get("flash_sequence") or []
+    if not seq:
+        return None
+    try:
+        item = seq[int(flash_index) % len(seq)]
+        return _parse_flash_rgb(item.get("rgb") if isinstance(item, dict) else item)
+    except Exception:
+        return None
+
+
+def _flash_response_check(seen: list[dict], challenge_steps: list[dict] | None) -> dict:
+    """校验随机屏幕闪光挑战。
+
+    预录视频只能提前录到固定光照；本次 session 的随机颜色序列无法提前出现在视频里。
+    因此要求人脸区域平均颜色/亮度与服务端下发的 flash_sequence 存在同步相关性。
+    """
+    if not challenge_steps:
+        return {
+            "pass": True,
+            "enabled": False,
+            "reason": "未启用随机闪光挑战",
+            "coverage": 0.0,
+            "color_corr": 0.0,
+            "brightness_corr": 0.0,
+            "response_amplitude": 0.0,
+            "invalid_meta_ratio": 0.0,
+        }
+    rows = [r for r in seen if r.get("expected_flash_rgb") is not None and r.get("face_rgb")]
+    if len(rows) < 6:
+        return {"pass": False, "enabled": True, "reason": "随机闪光响应帧不足", "coverage": 0.0, "color_corr": 0.0, "brightness_corr": 0.0, "response_amplitude": 0.0, "invalid_meta_ratio": 1.0}
+    stage_results = []
+    invalid = 0
+    for step in challenge_steps:
+        stage = int(step.get("stage", 0))
+        seq = step.get("flash_sequence") or []
+        srows = [r for r in rows if int(r.get("stage", 0)) == stage]
+        if not srows and len(challenge_steps) == 1:
+            srows = rows
+        if len(srows) < 4:
+            stage_results.append({"stage": stage, "pass": False, "reason": "该组闪光帧不足"})
+            continue
+        uniq = {int(r.get("flash_index", -1)) % max(len(seq), 1) for r in srows if r.get("flash_index") is not None}
+        coverage = len(uniq) / max(min(len(seq), 3), 1)
+        obs = np.array([r["face_rgb"] for r in srows], dtype=np.float32)
+        exp = np.array([r["expected_flash_rgb"] for r in srows], dtype=np.float32)
+        sent = np.array([r.get("sent_flash_rgb") or r["expected_flash_rgb"] for r in srows], dtype=np.float32)
+        invalid += int(np.sum(np.linalg.norm(sent - exp, axis=1) > 0.12))
+        # 自动白平衡会压缩绝对颜色，采用中心化 RGB 与亮度双相关，更适合普通摄像头。
+        obs_center = obs - obs.mean(axis=0, keepdims=True)
+        exp_center = exp - exp.mean(axis=0, keepdims=True)
+        channel_corrs = [_corr(obs_center[:, i], exp_center[:, i]) for i in range(3)]
+        color_corr = float(np.mean(channel_corrs))
+        obs_luma = obs @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        exp_luma = exp @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        brightness_corr = _corr(obs_luma, exp_luma)
+        response_amp = float(np.mean(np.std(obs, axis=0)) + np.std(obs_luma) * 0.35)
+        # 屏幕照明在不同环境中强弱不一，判定略保守：既看相关性，也看是否确有颜色波动。
+        ok = bool(coverage >= 0.66 and response_amp >= 0.0035 and (color_corr >= 0.10 or brightness_corr >= 0.10 or response_amp >= 0.012))
+        stage_results.append({
+            "stage": stage,
+            "pass": ok,
+            "coverage": round(float(coverage), 4),
+            "color_corr": round(float(color_corr), 4),
+            "brightness_corr": round(float(brightness_corr), 4),
+            "response_amplitude": round(float(response_amp), 6),
+        })
+    invalid_ratio = invalid / max(len(rows), 1)
+    passed = bool(stage_results and all(r.get("pass") for r in stage_results) and invalid_ratio <= 0.20)
+    if passed:
+        reason = "随机闪光响应同步"
+    elif invalid_ratio > 0.20:
+        reason = "闪光元数据与服务端挑战不一致"
+    else:
+        reason = "人脸区域未响应本次随机闪光，疑似预录视频/屏幕翻拍"
+    return {
+        "pass": passed,
+        "enabled": True,
+        "reason": reason,
+        "coverage": round(float(np.mean([r.get("coverage", 0) for r in stage_results]) if stage_results else 0.0), 4),
+        "color_corr": round(float(np.mean([r.get("color_corr", 0) for r in stage_results]) if stage_results else 0.0), 4),
+        "brightness_corr": round(float(np.mean([r.get("brightness_corr", 0) for r in stage_results]) if stage_results else 0.0), 4),
+        "response_amplitude": round(float(np.mean([r.get("response_amplitude", 0) for r in stage_results]) if stage_results else 0.0), 6),
+        "invalid_meta_ratio": round(float(invalid_ratio), 4),
+        "stages": stage_results,
+    }
+
+
+def _deepface_emotion(face_img: np.ndarray) -> dict | None:
+    """优先复用实验五 DeepFace 表情分析；不可用时返回 None 走轻量 fallback。"""
+    try:
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        from deepface import DeepFace  # type: ignore
+    except Exception:
+        return None
+    try:
+        res = DeepFace.analyze(
+            img_path=face_img,
+            actions=["emotion"],
+            detector_backend="skip",
+            enforce_detection=False,
+            silent=True,
+        )
+        if isinstance(res, list):
+            res = res[0]
+        raw_scores = res.get("emotion") or {}
+        scores = {str(k): float(v) / 100.0 for k, v in raw_scores.items()}
+        if not scores:
+            return None
+        label = str(res.get("dominant_emotion") or max(scores, key=scores.get))
+        conf = max(0.0, min(1.0, float(scores.get(label, max(scores.values())))))
+        return {"emotion": label, "confidence": round(conf, 4), "scores": {k: round(float(v), 4) for k, v in scores.items()}, "engine": "deepface"}
+    except Exception:
+        return None
+
+
+def _emotiefflib_emotion(face_img: np.ndarray) -> dict | None:
+    """队友版本：EfficientNet + ONNX 表情分类；失败时返回 None 让后续引擎兜底。"""
+    try:
+        recognizer = _get_emotion_recognizer()
+        if recognizer is None:
+            return None
+        emotion_labels, all_scores = recognizer.predict_emotions(face_img, logits=False)
+        if not emotion_labels or all_scores is None or len(all_scores) == 0:
+            return None
+        label = str(emotion_labels[0])
+        raw = np.asarray(all_scores[0], dtype=float).ravel()
+        idx_to_class = getattr(recognizer, "idx_to_emotion_class", {}) or {}
+        scores = {
+            str(idx_to_class.get(i, i)): round(float(raw[i]), 4)
+            for i in range(len(raw))
+        }
+        conf = round(float(scores.get(label, float(raw.max()) if raw.size else 0.0)), 4)
+        return {"emotion": label, "confidence": conf, "scores": scores, "engine": "emotiefflib"}
+    except Exception:
+        return None
 
 
 def save_image(img: np.ndarray, directory: Path, prefix: str = "img", ext: str = ".jpg") -> Path:
@@ -361,51 +662,75 @@ def recognize(
 ) -> dict:
     """在人脸库中按“学生”聚合匹配。
 
-    一个学生上传多张图片时，不再只把每张图当作互相独立的候选；系统会先计算
-    该学生所有样本的相似度，再用“最高分 + TopK 均值 + 样本覆盖奖励”聚合为
-    学生级分数。这样多张不同光照/角度照片能提升鲁棒性，但低质量或不相似样本
-    不会简单拉高结果。
-
-    返回 top-3 学生候选和 best/second/margin 信息，便于合照场景做
-    “自动识别 + 人工确认”。margin=0 时只要求达到阈值；margin>0 时还要求第一名
-    相对第二名有足够间隔，降低误识别。
+    多张照片不再只是“互相独立的候选样本”：系统会同时使用最佳单样本、TopK 均值、
+    质量加权质心、稳定支持样本数四类证据。这样同一学生上传正面、侧脸、不同光照
+    的多张图片后，任一图片可命中最佳样本，整体质心也会提高跨场景鲁棒性；低质量
+    或明显离群样本只弱参与，避免靠堆图虚高。
     """
+    query = np.array(list(embedding), dtype=np.float32)
+    if query.size == 0:
+        return {"matched": False, "student": None, "score": 0.0, "sample_id": None, "second_score": 0.0, "margin": 0.0, "candidates": []}
+    query /= (np.linalg.norm(query) + 1e-8)
     sample_candidates: list[dict] = []
     by_student: dict[int | str, dict] = {}
     for sample in samples:
         try:
-            emb = json.loads(sample["embedding"])
-            score = cosine_similarity(embedding, emb)
+            emb = np.array(json.loads(sample["embedding"]), dtype=np.float32)
+            if emb.size != query.size:
+                continue
+            emb /= (np.linalg.norm(emb) + 1e-8)
+            score = float(np.dot(query, emb))
         except Exception:
             continue
         item = {"student": sample, "score": float(score), "sample_id": sample.get("id")}
         sample_candidates.append(item)
         sid = sample.get("student_id") or sample.get("id") or sample.get("student_no")
-        bucket = by_student.setdefault(sid, {"student": sample, "scores": [], "sample_ids": []})
+        bucket = by_student.setdefault(sid, {"student": sample, "scores": [], "sample_ids": [], "embeddings": [], "qualities": []})
         bucket["scores"].append(float(score))
         bucket["sample_ids"].append(sample.get("id"))
+        bucket["embeddings"].append(emb)
+        try:
+            bucket["qualities"].append(float(sample.get("quality") or 0.5))
+        except Exception:
+            bucket["qualities"].append(0.5)
 
     if not sample_candidates:
         return {"matched": False, "student": None, "score": 0.0, "sample_id": None, "second_score": 0.0, "margin": 0.0, "candidates": []}
 
     student_candidates: list[dict] = []
     for bucket in by_student.values():
-        scores = sorted(bucket["scores"], reverse=True)
-        best_score = scores[0]
-        topk = scores[: min(3, len(scores))]
+        raw_scores = list(bucket["scores"])
+        sorted_scores = sorted(raw_scores, reverse=True)
+        best_score = float(sorted_scores[0])
+        topk = sorted_scores[: min(5, len(sorted_scores))]
         topk_mean = float(np.mean(topk))
-        # 多样本奖励有上限，避免堆大量低质量图片导致虚高；只有接近最佳分的样本才贡献稳定性。
-        support = sum(1 for s in scores if s >= best_score - 0.06)
-        support_bonus = min(0.035, max(0, support - 1) * 0.012)
-        aggregate_score = min(1.0, 0.82 * best_score + 0.18 * topk_mean + support_bonus)
-        best_index = bucket["scores"].index(best_score)
+        support = sum(1 for s in sorted_scores if s >= best_score - 0.075 or s >= threshold - 0.035)
+        support_bonus = min(0.050, max(0, support - 1) * 0.014)
+
+        embeddings = np.vstack(bucket["embeddings"])
+        qualities = np.array(bucket["qualities"], dtype=np.float32)
+        # 质量 + 与当前查询接近程度共同决定质心权重：多视角样本能增强鲁棒性，离群样本不会拖垮。
+        score_arr = np.array(raw_scores, dtype=np.float32)
+        rel = np.clip((score_arr - max(best_score - 0.16, 0.0)) / 0.16, 0.05, 1.0)
+        q_weights = np.clip(qualities, 0.20, 1.0) * rel
+        if float(q_weights.sum()) <= 1e-6:
+            q_weights = np.ones_like(q_weights)
+        centroid = np.average(embeddings, axis=0, weights=q_weights)
+        centroid /= (np.linalg.norm(centroid) + 1e-8)
+        centroid_score = float(np.dot(query, centroid))
+
+        # 保底取最佳单样本，避免同学上传多张差异很大的照片后平均值把正确样本“稀释”。
+        blended = 0.68 * best_score + 0.18 * topk_mean + 0.14 * centroid_score + support_bonus
+        aggregate_score = min(1.0, max(best_score, blended, centroid_score + min(0.028, support_bonus)))
+        best_index = raw_scores.index(best_score)
         student_candidates.append({
             "student": bucket["student"],
             "score": float(aggregate_score),
             "sample_id": bucket["sample_ids"][best_index],
             "best_sample_score": float(best_score),
             "topk_mean_score": topk_mean,
-            "sample_count": len(scores),
+            "centroid_score": centroid_score,
+            "sample_count": len(raw_scores),
             "support_count": support,
         })
 
@@ -425,6 +750,7 @@ def recognize(
         "threshold": float(threshold),
         "best_sample_score": float(best.get("best_sample_score", best["score"])),
         "topk_mean_score": float(best.get("topk_mean_score", best["score"])),
+        "centroid_score": float(best.get("centroid_score", best["score"])),
         "sample_count": int(best.get("sample_count", 1)),
         "support_count": int(best.get("support_count", 1)),
         "candidates": student_candidates[:3],
@@ -432,7 +758,7 @@ def recognize(
     }
 
 
-def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> dict:
+def analyze_liveness(frames: list[dict], actions: list[str] | None = None, challenge_steps: list[dict] | None = None) -> dict:
     """后端动作活体检测。
 
     新版本按 3 组随机动作进行挑战：前端只有在某组动作通过后才进入下一组，
@@ -444,6 +770,7 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
     observations: list[dict] = []
     hashes: list[str] = []
     decoded_frames: list[np.ndarray] = []
+    crop_norm_frames: list[tuple[int, np.ndarray]] = []
 
     for seq, item in enumerate(frames):
         try:
@@ -465,6 +792,15 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         box = faces[0]
         h, w = img.shape[:2]
         crop = crop_face(img, box)
+        signal = _crop_signal_features(crop)
+        flash_index_raw = item.get("flash_index")
+        try:
+            flash_index = int(flash_index_raw) if flash_index_raw is not None else None
+        except (TypeError, ValueError):
+            flash_index = None
+        sent_flash_rgb = _parse_flash_rgb(item.get("flash_rgb") or item.get("expected_flash_rgb"))
+        expected_rgb = _expected_flash_rgb(stage, flash_index, challenge_steps)
+        crop_norm_frames.append((seq, signal.pop("norm_gray")))
         observations.append({
             "seq": seq,
             "stage": stage,
@@ -474,6 +810,10 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
             "cy": box.center()[1] / max(h, 1),
             "area": box.area() / max(w * h, 1),
             "quality": quality_score(crop),
+            "flash_index": flash_index,
+            "sent_flash_rgb": sent_flash_rgb,
+            "expected_flash_rgb": expected_rgb,
+            **signal,
         })
 
     seen = [o for o in observations if o.get("seen")]
@@ -490,6 +830,10 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         rows = by_stage.get(stage, [])
         if not rows:
             return None
+        total_stage_frames = sum(
+            1 for r in observations
+            if int(r.get("stage", 0)) == int(stage)
+        )
         n = len(rows)
         k = max(1, int(math.ceil(n / 3)))
         early = rows[:k]
@@ -503,9 +847,18 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         areas = [r["area"] for r in rows]
         cxs = [r["cx"] for r in rows]
         cys = [r["cy"] for r in rows]
+        eye_dark_vals = [r.get("eye_dark", 0.0) for r in rows]
+        eye_edge_vals = [r.get("eye_edge", 0.0) for r in rows]
+        mouth_open_vals = [r.get("mouth_open", 0.0) for r in rows]
+        mouth_dark_vals = [r.get("mouth_dark", 0.0) for r in rows]
+        mouth_edge_vals = [r.get("mouth_edge", 0.0) for r in rows]
+        yaw_vals = [r.get("yaw_proxy", 0.0) for r in rows]
+        aspect_vals = [r.get("face_aspect", 0.0) for r in rows]
         return {
             "stage": stage,
             "seen_frames": n,
+            "total_stage_frames": total_stage_frames,
+            "face_seen_ratio": n / max(total_stage_frames, 1),
             "first_cx": avg(early, "cx"),
             "last_cx": avg(late, "cx"),
             "first_cy": avg(early, "cy"),
@@ -523,6 +876,22 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
             "max_area": float(max(areas)),
             "duration_ms": duration_ms,
             "avg_quality": avg(rows, "quality"),
+            "first_eye_dark": avg(early, "eye_dark"),
+            "last_eye_dark": avg(late, "eye_dark"),
+            "min_eye_dark": float(min(eye_dark_vals)),
+            "max_eye_dark": float(max(eye_dark_vals)),
+            "eye_edge_range": float(max(eye_edge_vals) - min(eye_edge_vals)),
+            "first_mouth_open": avg(early, "mouth_open"),
+            "last_mouth_open": avg(late, "mouth_open"),
+            "min_mouth_open": float(min(mouth_open_vals)),
+            "max_mouth_open": float(max(mouth_open_vals)),
+            "mouth_dark_range": float(max(mouth_dark_vals) - min(mouth_dark_vals)),
+            "mouth_edge_range": float(max(mouth_edge_vals) - min(mouth_edge_vals)),
+            "first_yaw_proxy": avg(early, "yaw_proxy"),
+            "last_yaw_proxy": avg(late, "yaw_proxy"),
+            "min_yaw_proxy": float(min(yaw_vals)),
+            "max_yaw_proxy": float(max(yaw_vals)),
+            "aspect_range": float(max(aspect_vals) - min(aspect_vals)),
         }
 
     base_stats = stage_stats(0)
@@ -545,12 +914,27 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         st = stage_stats(stage)
         if not st:
             return {"stage": stage, "action": action, "ok": False, "delta": 0.0, "reason": "该组未检测到人脸"}
+        action_alias = {
+            "nod_up_down": "nod",
+            "shake_left_right": "move_right",
+            "zoom_in_out": "move_closer",
+        }
+        action = action_alias.get(action, action)
         dx = st["last_cx"] - st["first_cx"]
         dy = st["last_cy"] - st["first_cy"]
         area_ratio = st["last_area"] / (st["first_area"] + 1e-6)
         x_range = st["max_cx"] - st["min_cx"]
         y_range = st["max_cy"] - st["min_cy"]
         area_range_ratio = st["max_area"] / (st["min_area"] + 1e-6)
+        eye_dark_delta = st["last_eye_dark"] - st["first_eye_dark"]
+        eye_dark_range = st["max_eye_dark"] - st["min_eye_dark"]
+        mouth_delta = st["last_mouth_open"] - st["first_mouth_open"]
+        mouth_range = st["max_mouth_open"] - st["min_mouth_open"]
+        yaw_delta = st["last_yaw_proxy"] - st["first_yaw_proxy"]
+        yaw_range = st["max_yaw_proxy"] - st["min_yaw_proxy"]
+        step = next((s for s in (challenge_steps or []) if int(s.get("stage", 0)) == int(stage)), None)
+        flash_rows = [r for r in by_stage.get(stage, []) if r.get("expected_flash_rgb") is not None and r.get("face_rgb")]
+        flash_stage_check = _flash_response_check(flash_rows, [step]) if step else {"pass": False, "reason": "该组未启用随机闪光"}
         timeout_ok = st["duration_ms"] is None or st["duration_ms"] <= 5500
         enough_frames = st["seen_frames"] >= 3
         ok = False
@@ -567,16 +951,6 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
             baseline_delta = (st["mean_cx"] - base_stats["mean_cx"]) if base_stats else 0.0
             ok = delta > 0.018 or baseline_delta > 0.025
             detail = f"right_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
-        elif action == "move_up":
-            delta = -dy
-            baseline_delta = (base_stats["mean_cy"] - st["mean_cy"]) if base_stats else 0.0
-            ok = delta > 0.016 or baseline_delta > 0.020
-            detail = f"up_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
-        elif action == "move_down":
-            delta = dy
-            baseline_delta = (st["mean_cy"] - base_stats["mean_cy"]) if base_stats else 0.0
-            ok = delta > 0.016 or baseline_delta > 0.020
-            detail = f"down_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
         elif action == "move_closer":
             delta = area_ratio - 1.0
             baseline_ratio = (st["mean_area"] / (base_stats["mean_area"] + 1e-6)) if base_stats else 1.0
@@ -587,18 +961,31 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
             baseline_ratio = (st["mean_area"] / (base_stats["mean_area"] + 1e-6)) if base_stats else 1.0
             ok = area_ratio < 0.955 or baseline_ratio < 0.940
             detail = f"area_ratio={area_ratio:.4f}, baseline_ratio={baseline_ratio:.4f}"
-        elif action == "shake_left_right":
-            delta = x_range
-            ok = x_range > 0.040 and abs(dx) > 0.010
-            detail = f"x_range={x_range:.4f}, net_dx={dx:.4f}"
-        elif action == "nod_up_down":
+        elif action == "nod":
             delta = y_range
-            ok = y_range > 0.032 and abs(dy) > 0.008
+            ok = y_range > 0.030 or abs(dy) > 0.020
             detail = f"y_range={y_range:.4f}, net_dy={dy:.4f}"
-        elif action == "zoom_in_out":
-            delta = area_range_ratio - 1.0
-            ok = area_range_ratio > 1.100
-            detail = f"area_range_ratio={area_range_ratio:.4f}"
+        elif action == "blink":
+            delta = eye_dark_range
+            temporary_eye_loss = st["seen_frames"] >= 3 and 0.45 <= st["face_seen_ratio"] <= 0.88
+            ok = eye_dark_range > 0.045 or (abs(eye_dark_delta) > 0.032 and st["eye_edge_range"] > 0.010) or temporary_eye_loss
+            detail = f"eye_dark_range={eye_dark_range:.4f}, eye_dark_delta={eye_dark_delta:.4f}, eye_edge_range={st['eye_edge_range']:.4f}, face_seen_ratio={st['face_seen_ratio']:.4f}"
+        elif action == "open_mouth":
+            delta = max(mouth_delta, mouth_range)
+            ok = mouth_delta > 0.030 or mouth_range > 0.050 or (st["mouth_dark_range"] > 0.035 and st["mouth_edge_range"] > 0.010)
+            detail = f"mouth_delta={mouth_delta:.4f}, mouth_range={mouth_range:.4f}, mouth_dark_range={st['mouth_dark_range']:.4f}"
+        elif action == "turn_left":
+            delta = -yaw_delta
+            ok = delta > 0.010 or (yaw_range > 0.018 and st["aspect_range"] > 0.010) or (abs(dx) > 0.012 and yaw_range > 0.012)
+            detail = f"yaw_left_delta={delta:.4f}, yaw_range={yaw_range:.4f}, aspect_range={st['aspect_range']:.4f}, net_dx={dx:.4f}"
+        elif action == "turn_right":
+            delta = yaw_delta
+            ok = delta > 0.010 or (yaw_range > 0.018 and st["aspect_range"] > 0.010) or (abs(dx) > 0.012 and yaw_range > 0.012)
+            detail = f"yaw_right_delta={delta:.4f}, yaw_range={yaw_range:.4f}, aspect_range={st['aspect_range']:.4f}, net_dx={dx:.4f}"
+        elif action == "flash_response":
+            delta = float(flash_stage_check.get("response_amplitude", 0.0) or 0.0)
+            ok = bool(flash_stage_check.get("pass"))
+            detail = f"flash={flash_stage_check.get('reason')}, color_corr={flash_stage_check.get('color_corr', 0)}, brightness_corr={flash_stage_check.get('brightness_corr', 0)}, amp={flash_stage_check.get('response_amplitude', 0)}"
         elif action == "center":
             delta = max(x_range, y_range)
             ok = x_range < 0.055 and y_range < 0.055
@@ -634,10 +1021,16 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
     cxs = [o["cx"] for o in seen]
     cys = [o["cy"] for o in seen]
     areas = [o["area"] for o in seen]
+    eye_motion = max([o.get("eye_dark", 0.0) for o in seen]) - min([o.get("eye_dark", 0.0) for o in seen])
+    mouth_motion = max([o.get("mouth_open", 0.0) for o in seen]) - min([o.get("mouth_open", 0.0) for o in seen])
+    yaw_motion = max([o.get("yaw_proxy", 0.0) for o in seen]) - min([o.get("yaw_proxy", 0.0) for o in seen])
     natural_motion = (
         (max(cxs) - min(cxs) > 0.040)
         or (max(cys) - min(cys) > 0.032)
         or (max(areas) / (min(areas) + 1e-6) > 1.10)
+        or eye_motion > 0.045
+        or mouth_motion > 0.055
+        or yaw_motion > 0.018
     )
     action_pass_count = sum(1 for c in motion_checks if c.get("ok"))
     motion_pass = all(c.get("ok") for c in motion_checks) if motion_checks else natural_motion
@@ -650,21 +1043,50 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
     else:
         avg_frame_diff = 0.0
     static_replay = unique_ratio < 0.35 and avg_frame_diff < 0.003
+
+    crop_diffs = []
+    for i in range(1, len(crop_norm_frames)):
+        crop_diffs.append(float(np.mean(np.abs(crop_norm_frames[i][1] - crop_norm_frames[i - 1][1]))))
+    avg_crop_diff = float(np.mean(crop_diffs)) if crop_diffs else 0.0
+    crop_hashes = [o.get("norm_hash", "") for o in seen if o.get("norm_hash")]
+    crop_unique_ratio = len(set(crop_hashes)) / max(len(crop_hashes), 1)
+    motion_extent = max(max(cxs) - min(cxs), max(cys) - min(cys), max(areas) / (min(areas) + 1e-6) - 1.0)
+    avg_specular = float(np.mean([o.get("specular_ratio", 0) for o in seen]))
+    avg_moire = float(np.mean([o.get("moire_score", 0) for o in seen]))
+    avg_fft_high = float(np.mean([o.get("fft_high_ratio", 0) for o in seen]))
+    # 举着同一张照片移动时，整帧变化明显，但归一化人脸几乎刚性不变；真人动作会带来微表情、姿态和光照变化。
+    rigid_planar_replay = bool(motion_extent > 0.035 and len(crop_diffs) >= 5 and (avg_crop_diff < 0.0045 or crop_unique_ratio < 0.28))
+    synthetic_plain_background = bool(float(np.std(cxs)) > 0.0 and np.mean([o.get("face_sat", 0) for o in seen]) > 0.25 and avg_quality > 0.88 and unique_ratio > 0.45)
+    screen_or_print_risk = bool(
+        not synthetic_plain_background
+        and ((avg_specular > 0.030 and avg_moire > 0.055) or (avg_specular > 0.006 and avg_moire > 0.090 and avg_fft_high > 0.34))
+    )
+    anti_spoof_pass = not (rigid_planar_replay or screen_or_print_risk)
+    flash_check = _flash_response_check(seen, challenge_steps)
+
     temporal_pass = not static_replay
     stage_timeout_pass = all(c.get("duration_ms") is None or c.get("duration_ms", 0) <= 5500 for c in motion_checks)
     action_ratio = action_pass_count / max(len(actions), 1) if actions else (1.0 if natural_motion else 0.0)
     score = (
-        0.55 * action_ratio
-        + 0.20 * min(avg_quality / 0.70, 1.0)
-        + 0.10 * min(len(seen) / max(len(frames), 1), 1.0)
+        0.43 * action_ratio
+        + 0.17 * min(avg_quality / 0.70, 1.0)
+        + 0.09 * min(len(seen) / max(len(frames), 1), 1.0)
         + 0.10 * (1.0 if temporal_pass else 0.0)
-        + 0.05 * (1.0 if stage_timeout_pass else 0.0)
+        + 0.08 * (1.0 if anti_spoof_pass else 0.0)
+        + 0.10 * (1.0 if flash_check.get("pass") else 0.0)
+        + 0.03 * (1.0 if stage_timeout_pass else 0.0)
     )
-    passed = bool(score >= 0.68 and motion_pass and quality_pass and temporal_pass and stage_timeout_pass)
+    passed = bool(score >= 0.72 and motion_pass and quality_pass and temporal_pass and anti_spoof_pass and flash_check.get("pass") and stage_timeout_pass)
     if passed:
         reason = "通过"
     elif static_replay:
         reason = "检测到重复静态帧，疑似照片/重放攻击"
+    elif not flash_check.get("pass"):
+        reason = flash_check.get("reason") or "随机闪光响应失败"
+    elif rigid_planar_replay:
+        reason = "归一化人脸几乎刚性不变，疑似举照片/屏幕画面移动"
+    elif screen_or_print_risk:
+        reason = "检测到异常高光/摩尔纹，疑似屏幕或打印件翻拍"
     elif not stage_timeout_pass:
         reason = "单组动作超过 5 秒限制"
     elif not motion_pass:
@@ -679,6 +1101,16 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         "avg_quality": round(avg_quality, 4),
         "unique_frame_ratio": round(float(unique_ratio), 4),
         "avg_frame_diff": round(float(avg_frame_diff), 5),
+        "avg_crop_diff": round(float(avg_crop_diff), 6),
+        "crop_unique_ratio": round(float(crop_unique_ratio), 4),
+        "anti_spoof_pass": bool(anti_spoof_pass),
+        "rigid_planar_replay": bool(rigid_planar_replay),
+        "screen_or_print_risk": bool(screen_or_print_risk),
+        "synthetic_plain_background": bool(synthetic_plain_background),
+        "avg_specular_ratio": round(float(avg_specular), 6),
+        "avg_moire_score": round(float(avg_moire), 6),
+        "flash_challenge_pass": bool(flash_check.get("pass")),
+        "flash_challenge": flash_check,
         "seen_frames": len(seen),
         "total_frames": len(frames),
         "action_pass_count": action_pass_count,
@@ -691,17 +1123,57 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
 def analyze_emotion(face_img: np.ndarray) -> dict:
     if face_img is None or face_img.size == 0:
         return {"emotion": "unknown", "confidence": 0.0}
-    try:
-        fer = _get_emotion_recognizer()
-        emotion_labels, all_scores = fer.predict_emotions(face_img, logits=False)
-        label = emotion_labels[0]
-        raw = all_scores[0]
-        idx_to_class = fer.idx_to_emotion_class
-        scores = {idx_to_class[i]: round(float(raw[i]), 4) for i in range(len(raw))}
-        conf = round(float(scores.get(label, 0)), 4)
-        return {"emotion": label, "confidence": conf, "scores": scores}
-    except Exception:
-        return {"emotion": "unknown", "confidence": 0.0}
+    eff = _emotiefflib_emotion(face_img)
+    if eff is not None:
+        return eff
+    deep = _deepface_emotion(face_img)
+    if deep is not None:
+        return deep
+
+    # 轻量 fallback：不用重模型时仍给出多类别结果，避免旧版 neutral 一票否决导致全班同一种情绪。
+    gray0 = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray0, (112, 112), interpolation=cv2.INTER_AREA)
+    gray = cv2.equalizeHist(gray)
+    upper = gray[:48, :]
+    eye_band = gray[20:52, :]
+    middle = gray[36:76, :]
+    lower = gray[62:, :]
+    mouth = gray[72:104, 24:88]
+    brightness = gray0.mean() / 255.0
+    contrast = min(gray0.std() / 72.0, 1.4)
+    dark_thr = np.percentile(gray, 27)
+    mouth_dark = float((mouth < dark_thr).mean()) if mouth.size else 0.0
+    eye_dark = float((eye_band < np.percentile(gray, 24)).mean()) if eye_band.size else 0.0
+    lower_edge = cv2.Canny(lower, 70, 150).mean() / 255.0
+    mouth_edge = cv2.Canny(mouth, 55, 135).mean() / 255.0 if mouth.size else 0.0
+    mid_sym = 1.0 - np.mean(np.abs(middle[:, :56].astype(float) - np.fliplr(middle[:, 56:]).astype(float))) / 255.0
+    # 嘴角/眉眼粗略几何：用暗像素重心和边缘方向代替关键点，保证无 dlib 模型也可运行。
+    if mouth.size:
+        ys, xs = np.where(mouth < dark_thr)
+        mouth_open = min(1.0, len(xs) / max(mouth.size * 0.18, 1))
+        mouth_center_y = float(np.mean(ys) / max(mouth.shape[0], 1)) if len(ys) else 0.5
+    else:
+        mouth_open, mouth_center_y = 0.0, 0.5
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    brow_slope = float(np.mean(np.abs(gy[18:40, 18:94])) / (np.mean(np.abs(gx[18:40, 18:94])) + 1e-6))
+
+    scores = {
+        "happy": 0.18 + 0.52 * mouth_edge + 0.36 * mouth_dark + 0.12 * brightness + 0.10 * mid_sym,
+        "surprise": 0.14 + 0.62 * mouth_open + 0.24 * eye_dark + 0.10 * lower_edge,
+        "sad": 0.16 + 0.30 * (1 - brightness) + 0.20 * eye_dark + 0.18 * max(0.0, mouth_center_y - 0.48),
+        "angry": 0.15 + 0.33 * contrast + 0.28 * eye_dark + 0.14 * min(brow_slope / 2.0, 1.0) + 0.08 * (1 - mid_sym),
+        "neutral": 0.30 + 0.20 * mid_sym + 0.10 * (1 - abs(brightness - 0.52)) + 0.08 * (1 - mouth_open),
+    }
+    best_non_neutral = max((k for k in scores if k != "neutral"), key=scores.get)
+    # 只有非中性优势非常弱时才返回 neutral，避免所有样本被默认 neutral 吸走。
+    if scores["neutral"] >= scores[best_non_neutral] + 0.08:
+        label = "neutral"
+    else:
+        label = best_non_neutral
+    total = sum(max(v, 0.0) for v in scores.values()) + 1e-6
+    conf = max(0.35, min(scores[label] / total * 2.15, 0.94))
+    return {"emotion": label, "confidence": round(float(conf), 4), "scores": {k: round(float(v), 4) for k, v in scores.items()}, "engine": "heuristic"}
 
 
 def annotate_group_image(img: np.ndarray, results: list[dict]) -> Path:

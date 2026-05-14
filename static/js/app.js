@@ -2,6 +2,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 let me = null;
 let mediaStream = null;
+let livenessFlashOverlay = null;
 
 async function api(url, options = {}) {
   const res = await fetch(url, {
@@ -80,12 +81,64 @@ async function startCamera() {
 }
 $('#startCameraBtn').addEventListener('click', startCamera);
 
+function ensureFlashOverlay() {
+  if (livenessFlashOverlay) return livenessFlashOverlay;
+  const card = $('.camera-card');
+  livenessFlashOverlay = document.createElement('div');
+  livenessFlashOverlay.id = 'livenessFlashOverlay';
+  livenessFlashOverlay.className = 'liveness-flash hidden';
+  livenessFlashOverlay.innerHTML = '<div class="flash-core">LIVE CHALLENGE</div>';
+  card?.appendChild(livenessFlashOverlay);
+  return livenessFlashOverlay;
+}
+
+function setFlashColor(rgb, label = '') {
+  const overlay = ensureFlashOverlay();
+  if (!rgb) {
+    overlay.classList.add('hidden');
+    return;
+  }
+  const color = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+  overlay.style.background = color;
+  overlay.style.boxShadow = `0 0 42px ${color}`;
+  overlay.querySelector('.flash-core').textContent = label || `FLASH ${rgb.join(',')}`;
+  overlay.classList.remove('hidden');
+}
+
+function hideFlashColor() {
+  if (livenessFlashOverlay) livenessFlashOverlay.classList.add('hidden');
+}
+
+function activeFlashForStep(step, elapsed) {
+  const seq = step.flash_sequence || [];
+  if (!seq.length) return null;
+  const interval = step.flash_interval_ms || 520;
+  const index = Math.floor(elapsed / interval) % seq.length;
+  const item = seq[index];
+  return {index, rgb: item.rgb || item, name: item.name || String(index + 1)};
+}
+
 function captureFrame(stage, extra = {}) {
   const video = $('#video');
   const canvas = $('#captureCanvas');
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
-  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  // 将随机闪光色块写入采集帧边缘，帮助普通摄像头捕获当前挑战光照；
+  // 后端仍以 session 中的随机序列校验，前端元数据不能单独绕过。
+  if (extra.flash_rgb) {
+    const [r, g, b] = extra.flash_rgb;
+    ctx.save();
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+    const band = Math.max(24, Math.round(canvas.width * 0.055));
+    ctx.fillRect(0, 0, canvas.width, band);
+    ctx.fillRect(0, canvas.height - band, canvas.width, band);
+    ctx.fillRect(0, 0, band, canvas.height);
+    ctx.fillRect(canvas.width - band, 0, band, canvas.height);
+    ctx.restore();
+  }
   return {stage, image: canvas.toDataURL('image/jpeg', 0.82), ...extra};
 }
 
@@ -119,11 +172,12 @@ function actionGuide(action) {
     move_right: '保持脸在画面内，平移到屏幕右侧。',
     move_closer: '脸部慢慢靠近摄像头，让人脸框变大。',
     move_away: '脸部慢慢远离摄像头，让人脸框变小。',
-    move_up: '脸部向屏幕上方移动，不要离开画面。',
-    move_down: '脸部向屏幕下方移动，不要离开画面。',
-    shake_left_right: '从左到右或从右到左移动一次，幅度要明显。',
-    nod_up_down: '上下点头一次，幅度要明显。',
-    zoom_in_out: '先靠近再远离，保持脸始终在画面内。'
+    nod: '轻轻点头一次，动作幅度要明显但不要离开画面。',
+    blink: '看着摄像头快速眨眼一次。',
+    open_mouth: '保持正脸，张嘴一次后闭合。',
+    turn_left: '保持脸在画面内，向左转头一次。',
+    turn_right: '保持脸在画面内，向右转头一次。',
+    flash_response: '保持正脸不做其它动作，让屏幕随机颜色照到脸上。'
   };
   return guides[action] || '按屏幕提示完成动作。';
 }
@@ -137,10 +191,14 @@ async function captureStageUntilPass(challenge, step, allFrames) {
 
   while (performance.now() - startedAt < timeoutMs) {
     const elapsed = performance.now() - startedAt;
+    const flash = activeFlashForStep(step, elapsed);
+    if (flash) setFlashColor(flash.rgb, `STAGE ${step.group || step.stage} · ${flash.name}`);
     const frame = captureFrame(step.stage, {
       action: step.action,
       stage_elapsed_ms: Math.round(elapsed),
-      captured_at_ms: Date.now()
+      captured_at_ms: Date.now(),
+      flash_index: flash ? flash.index : null,
+      flash_rgb: flash ? flash.rgb : null
     });
     frames.push(frame);
     allFrames.push(frame);
@@ -149,6 +207,7 @@ async function captureStageUntilPass(challenge, step, allFrames) {
     $('#attendanceMsg').textContent =
       `${step.hint || `第 ${step.group}/${challenge.group_count} 组`}\n` +
       `动作：${step.label}\n提示：${actionGuide(step.action)}\n` +
+      `随机闪光：${flash ? flash.name + ' [' + flash.rgb.join(',') + ']' : '未启用'}\n` +
       `剩余：${remain} 秒\n状态：${lastReason}`;
 
     if (frames.length >= 4 && performance.now() - lastCheckAt > 650) {
@@ -183,7 +242,7 @@ $('#startCheckBtn').addEventListener('click', async () => {
     const challenge = (await api('/api/attendance/challenge')).challenge;
     const stepsEl = $('#challengeSteps');
     stepsEl.innerHTML = challenge.steps.map(s =>
-      `<li data-stage="${s.stage}"><strong>第 ${s.group}/${challenge.group_count} 组</strong>：${escapeHtml(s.label)} <span class="small">≤${s.timeout_seconds}s</span></li>`
+      `<li data-stage="${s.stage}"><strong>第 ${s.group}/${challenge.group_count} 组</strong>：${escapeHtml(s.label)} <span class="small">≤${s.timeout_seconds}s · 随机闪光${(s.flash_sequence || []).length}段</span></li>`
     ).join('');
     const frames = [];
     for (const step of challenge.steps) {
@@ -199,6 +258,7 @@ $('#startCheckBtn').addEventListener('click', async () => {
       $('#attendanceMsg').textContent = `第 ${step.group}/${challenge.group_count} 组已通过：${step.label}\n准备进入下一组...`;
       await wait(450);
     }
+    hideFlashColor();
     $('#attendanceMsg').textContent = '采集完成，正在后端进行活体检测、人脸比对与情绪分析...';
     const data = await api('/api/attendance/check', {method: 'POST', body: JSON.stringify({challenge_id: challenge.id, frames})});
     const r = data.result;
@@ -211,6 +271,7 @@ $('#startCheckBtn').addEventListener('click', async () => {
       `情绪：${r.emotion.emotion}（${fmt(r.emotion.confidence)}）\n备注：${r.note || '-'}`;
     await Promise.allSettled([loadSummary(), loadRecords(), loadStats()]);
   } catch (err) {
+    hideFlashColor();
     $('#attendanceMsg').className = 'result-box bad';
     $('#attendanceMsg').textContent = err.message;
   }
@@ -434,6 +495,56 @@ $('#sampleAttackBtn')?.addEventListener('click', async () => {
   }
 });
 
+$('#movingPhotoAttackBtn')?.addEventListener('click', async () => {
+  $('#securityResult').className = 'result-box';
+  $('#securityResult').textContent = '正在模拟“举着照片移动”攻击...';
+  try {
+    const data = await api('/api/liveness/self-test-moving-photo', {method: 'POST', body: '{}'});
+    const live = data.liveness;
+    $('#securityResult').className = 'result-box ' + (!live.pass ? 'ok' : 'bad');
+    $('#securityResult').textContent =
+      `攻击类型：${data.attack}
+样本：${data.sample.student_no} ${data.sample.name}
+预期：${data.expected}
+实际活体：${live.pass ? '通过（需要改进）' : '拒绝（符合预期）'}
+` +
+      `原因：${live.reason}
+分数：${fmt(live.score)}
+动作通过：${live.action_pass_count}/${live.required_action_count}
+抗平面伪造：${live.anti_spoof_pass ? '通过' : '拒绝'}
+归一化人脸帧差：${live.avg_crop_diff}
+刚性平面判定：${live.rigid_planar_replay ? '是' : '否'}`;
+  } catch (err) {
+    $('#securityResult').className = 'result-box bad';
+    $('#securityResult').textContent = err.message;
+  }
+});
+
+$('#prerecordedAttackBtn')?.addEventListener('click', async () => {
+  $('#securityResult').className = 'result-box';
+  $('#securityResult').textContent = '正在模拟“预录视频无实时闪光响应”攻击...';
+  try {
+    const data = await api('/api/liveness/self-test-prerecorded', {method: 'POST', body: '{}'});
+    const live = data.liveness;
+    const flash = live.flash_challenge || {};
+    $('#securityResult').className = 'result-box ' + (!live.pass ? 'ok' : 'bad');
+    $('#securityResult').textContent =
+      `攻击类型：${data.attack}
+样本：${data.sample.student_no} ${data.sample.name}
+预期：${data.expected}
+实际活体：${live.pass ? '通过（需要改进）' : '拒绝（符合预期）'}
+` +
+      `原因：${live.reason}
+分数：${fmt(live.score)}
+动作通过：${live.action_pass_count}/${live.required_action_count}
+随机闪光：${live.flash_challenge_pass ? '通过' : '拒绝'}
+颜色相关：${fmt(flash.color_corr)}，亮度相关：${fmt(flash.brightness_corr)}，响应幅度：${flash.response_amplitude}`;
+  } catch (err) {
+    $('#securityResult').className = 'result-box bad';
+    $('#securityResult').textContent = err.message;
+  }
+});
+
 $('#randomnessBtn')?.addEventListener('click', async () => {
   $('#securityResult').className = 'result-box';
   $('#securityResult').textContent = '正在生成多组随机挑战...';
@@ -443,7 +554,8 @@ $('#randomnessBtn')?.addEventListener('click', async () => {
     $('#securityResult').textContent =
       `动作池：${data.action_count} 种；每次随机抽取 ${data.group_count} 组\n` +
       `组合空间：${data.total_sequences} 种有序挑战；下方展示前 ${data.generated} 组样例\n` +
-      `单组限时：${data.group_timeout_seconds} 秒；整次挑战有效期：${data.ttl_seconds} 秒\n\n` +
+      `单组限时：${data.group_timeout_seconds} 秒；整次挑战有效期：${data.ttl_seconds} 秒\n` +
+      `每组随机闪光：${data.flash_sequence_length || 0} 段；颜色池：${(data.flash_colors || []).map(c => c.name).join('、')}\n\n` +
       `动作池：${data.actions.map(a => a.label).join('、')}\n\n` +
       data.challenges.map(c => `${c.index}. ${c.labels.join(' -> ')}`).join('\n') +
       `\n\n说明：${data.explain}`;
