@@ -27,3 +27,6 @@ face_data/
 docs/report_render/
 docs/*.json
 docs/label_roi*.jpg
+*.rar
+*.7z
+*.zip

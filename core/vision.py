@@ -377,74 +377,216 @@ def recognize(
 
 
 def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> dict:
+    """后端动作活体检测。
+
+    新版本按 3 组随机动作进行挑战：前端只有在某组动作通过后才进入下一组，
+    后端最终仍会重新计算所有帧，避免篡改前端 JS 直接绕过。每个 stage 内部
+    使用“早期帧 -> 后期帧”的人脸中心、面积变化来判断动态动作；旧版带
+    stage=0 基准帧的数据也兼容。
+    """
     actions = actions or []
-    observations = []
+    observations: list[dict] = []
     hashes: list[str] = []
     decoded_frames: list[np.ndarray] = []
-    for item in frames:
+
+    for seq, item in enumerate(frames):
         try:
             img = image_from_base64(item.get("image", ""))
         except Exception:
             continue
         hashes.append(_tiny_frame_hash(img))
         decoded_frames.append(img)
+        stage = int(item.get("stage", 0))
+        elapsed_raw = item.get("stage_elapsed_ms", item.get("elapsed_ms"))
+        try:
+            elapsed_ms = float(elapsed_raw) if elapsed_raw is not None else None
+        except (TypeError, ValueError):
+            elapsed_ms = None
         faces = detect_faces(img, min_size=70)
         if not faces:
-            observations.append({"stage": int(item.get("stage", 0)), "seen": False})
+            observations.append({"seq": seq, "stage": stage, "elapsed_ms": elapsed_ms, "seen": False})
             continue
         box = faces[0]
         h, w = img.shape[:2]
         crop = crop_face(img, box)
         observations.append({
-            "stage": int(item.get("stage", 0)),
+            "seq": seq,
+            "stage": stage,
+            "elapsed_ms": elapsed_ms,
             "seen": True,
             "cx": box.center()[0] / max(w, 1),
             "cy": box.center()[1] / max(h, 1),
             "area": box.area() / max(w * h, 1),
             "quality": quality_score(crop),
         })
+
     seen = [o for o in observations if o.get("seen")]
     if len(seen) < max(4, int(len(frames) * 0.45)):
-        return {"pass": False, "score": 0.0, "reason": "有效人脸帧不足", "observations": observations}
+        return {"pass": False, "score": 0.0, "reason": "有效人脸帧不足", "observations": observations[-12:]}
 
     by_stage: dict[int, list[dict]] = {}
     for o in seen:
-        by_stage.setdefault(o["stage"], []).append(o)
+        by_stage.setdefault(int(o["stage"]), []).append(o)
+    for rows in by_stage.values():
+        rows.sort(key=lambda x: (x.get("elapsed_ms") is None, x.get("elapsed_ms") or x.get("seq", 0), x.get("seq", 0)))
 
-    def mean(stage: int, key: str) -> float | None:
-        vals = [o[key] for o in by_stage.get(stage, []) if key in o]
-        return float(np.mean(vals)) if vals else None
+    def stage_stats(stage: int) -> dict | None:
+        rows = by_stage.get(stage, [])
+        if not rows:
+            return None
+        n = len(rows)
+        k = max(1, int(math.ceil(n / 3)))
+        early = rows[:k]
+        late = rows[-k:]
 
-    base_cx = mean(0, "cx")
-    base_area = mean(0, "area")
-    motion_checks = []
-    for idx, action in enumerate(actions, start=1):
-        cx = mean(idx, "cx")
-        area = mean(idx, "area")
+        def avg(part: list[dict], key: str) -> float:
+            return float(np.mean([r[key] for r in part if key in r]))
+
+        elapsed_vals = [r.get("elapsed_ms") for r in rows if r.get("elapsed_ms") is not None]
+        duration_ms = float(max(elapsed_vals) - min(elapsed_vals)) if len(elapsed_vals) >= 2 else None
+        areas = [r["area"] for r in rows]
+        cxs = [r["cx"] for r in rows]
+        cys = [r["cy"] for r in rows]
+        return {
+            "stage": stage,
+            "seen_frames": n,
+            "first_cx": avg(early, "cx"),
+            "last_cx": avg(late, "cx"),
+            "first_cy": avg(early, "cy"),
+            "last_cy": avg(late, "cy"),
+            "first_area": avg(early, "area"),
+            "last_area": avg(late, "area"),
+            "mean_cx": avg(rows, "cx"),
+            "mean_cy": avg(rows, "cy"),
+            "mean_area": avg(rows, "area"),
+            "min_cx": float(min(cxs)),
+            "max_cx": float(max(cxs)),
+            "min_cy": float(min(cys)),
+            "max_cy": float(max(cys)),
+            "min_area": float(min(areas)),
+            "max_area": float(max(areas)),
+            "duration_ms": duration_ms,
+            "avg_quality": avg(rows, "quality"),
+        }
+
+    base_stats = stage_stats(0)
+    stage_numbers = sorted(s for s in by_stage.keys() if s != 0)
+
+    def stage_for_action(idx: int) -> int | None:
+        preferred = idx
+        if preferred in by_stage:
+            return preferred
+        # 兼容旧版：actions 第 1 个可能对应 stage=1，也可能对应 stage=0 之后的第一个非 0 stage。
+        if 0 in by_stage and idx in by_stage:
+            return idx
+        if idx - 1 in by_stage and idx - 1 != 0 and 0 in by_stage:
+            return idx - 1
+        if idx - 1 < len(stage_numbers):
+            return stage_numbers[idx - 1]
+        return None
+
+    def eval_action(stage: int, action: str) -> dict:
+        st = stage_stats(stage)
+        if not st:
+            return {"stage": stage, "action": action, "ok": False, "delta": 0.0, "reason": "该组未检测到人脸"}
+        dx = st["last_cx"] - st["first_cx"]
+        dy = st["last_cy"] - st["first_cy"]
+        area_ratio = st["last_area"] / (st["first_area"] + 1e-6)
+        x_range = st["max_cx"] - st["min_cx"]
+        y_range = st["max_cy"] - st["min_cy"]
+        area_range_ratio = st["max_area"] / (st["min_area"] + 1e-6)
+        timeout_ok = st["duration_ms"] is None or st["duration_ms"] <= 5500
+        enough_frames = st["seen_frames"] >= 3
         ok = False
         delta = 0.0
-        if base_cx is not None and base_area is not None and cx is not None and area is not None:
-            if action == "move_left":
-                delta = base_cx - cx
-                ok = delta > 0.025
-            elif action == "move_right":
-                delta = cx - base_cx
-                ok = delta > 0.025
-            elif action == "move_closer":
-                delta = area - base_area
-                ok = area > base_area * 1.08
-            elif action == "move_away":
-                delta = base_area - area
-                ok = area < base_area * 0.94
-        motion_checks.append({"action": action, "ok": bool(ok), "delta": float(delta)})
+        detail = ""
+
+        if action == "move_left":
+            delta = -dx
+            baseline_delta = (base_stats["mean_cx"] - st["mean_cx"]) if base_stats else 0.0
+            ok = delta > 0.018 or baseline_delta > 0.025
+            detail = f"left_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
+        elif action == "move_right":
+            delta = dx
+            baseline_delta = (st["mean_cx"] - base_stats["mean_cx"]) if base_stats else 0.0
+            ok = delta > 0.018 or baseline_delta > 0.025
+            detail = f"right_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
+        elif action == "move_up":
+            delta = -dy
+            baseline_delta = (base_stats["mean_cy"] - st["mean_cy"]) if base_stats else 0.0
+            ok = delta > 0.016 or baseline_delta > 0.020
+            detail = f"up_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
+        elif action == "move_down":
+            delta = dy
+            baseline_delta = (st["mean_cy"] - base_stats["mean_cy"]) if base_stats else 0.0
+            ok = delta > 0.016 or baseline_delta > 0.020
+            detail = f"down_delta={delta:.4f}, baseline_delta={baseline_delta:.4f}"
+        elif action == "move_closer":
+            delta = area_ratio - 1.0
+            baseline_ratio = (st["mean_area"] / (base_stats["mean_area"] + 1e-6)) if base_stats else 1.0
+            ok = area_ratio > 1.055 or baseline_ratio > 1.080
+            detail = f"area_ratio={area_ratio:.4f}, baseline_ratio={baseline_ratio:.4f}"
+        elif action == "move_away":
+            delta = 1.0 - area_ratio
+            baseline_ratio = (st["mean_area"] / (base_stats["mean_area"] + 1e-6)) if base_stats else 1.0
+            ok = area_ratio < 0.955 or baseline_ratio < 0.940
+            detail = f"area_ratio={area_ratio:.4f}, baseline_ratio={baseline_ratio:.4f}"
+        elif action == "shake_left_right":
+            delta = x_range
+            ok = x_range > 0.040 and abs(dx) > 0.010
+            detail = f"x_range={x_range:.4f}, net_dx={dx:.4f}"
+        elif action == "nod_up_down":
+            delta = y_range
+            ok = y_range > 0.032 and abs(dy) > 0.008
+            detail = f"y_range={y_range:.4f}, net_dy={dy:.4f}"
+        elif action == "zoom_in_out":
+            delta = area_range_ratio - 1.0
+            ok = area_range_ratio > 1.100
+            detail = f"area_range_ratio={area_range_ratio:.4f}"
+        elif action == "center":
+            delta = max(x_range, y_range)
+            ok = x_range < 0.055 and y_range < 0.055
+            detail = f"x_range={x_range:.4f}, y_range={y_range:.4f}"
+        else:
+            detail = "未知动作"
+
+        if not enough_frames:
+            ok = False
+            detail += ", 有效帧不足"
+        if not timeout_ok:
+            ok = False
+            detail += f", 单组超时 {st['duration_ms']:.0f}ms"
+        return {
+            "stage": stage,
+            "action": action,
+            "ok": bool(ok),
+            "delta": round(float(delta), 5),
+            "detail": detail,
+            "duration_ms": None if st["duration_ms"] is None else round(float(st["duration_ms"]), 1),
+            "seen_frames": st["seen_frames"],
+            "avg_quality": round(float(st["avg_quality"]), 4),
+        }
+
+    motion_checks = []
+    for idx, action in enumerate(actions, start=1):
+        stage = stage_for_action(idx)
+        if stage is None:
+            motion_checks.append({"stage": idx, "action": action, "ok": False, "delta": 0.0, "reason": "缺少该组采集帧"})
+        else:
+            motion_checks.append(eval_action(stage, action))
 
     cxs = [o["cx"] for o in seen]
+    cys = [o["cy"] for o in seen]
     areas = [o["area"] for o in seen]
-    natural_motion = (max(cxs) - min(cxs) > 0.045) or (max(areas) / (min(areas) + 1e-6) > 1.12)
-    strict_pass = all(c["ok"] for c in motion_checks) if motion_checks else natural_motion
-    motion_pass = strict_pass or (natural_motion and len(motion_checks) >= 2 and sum(c["ok"] for c in motion_checks) >= 1)
+    natural_motion = (
+        (max(cxs) - min(cxs) > 0.040)
+        or (max(cys) - min(cys) > 0.032)
+        or (max(areas) / (min(areas) + 1e-6) > 1.10)
+    )
+    action_pass_count = sum(1 for c in motion_checks if c.get("ok"))
+    motion_pass = all(c.get("ok") for c in motion_checks) if motion_checks else natural_motion
     avg_quality = float(np.mean([o.get("quality", 0) for o in seen]))
-    quality_pass = avg_quality >= 0.28
+    quality_pass = avg_quality >= 0.22
     unique_ratio = len(set(hashes)) / max(len(hashes), 1)
     if len(decoded_frames) >= 2:
         diffs = [_frame_diff(decoded_frames[i - 1], decoded_frames[i]) for i in range(1, len(decoded_frames))]
@@ -453,17 +595,22 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         avg_frame_diff = 0.0
     static_replay = unique_ratio < 0.35 and avg_frame_diff < 0.003
     temporal_pass = not static_replay
+    stage_timeout_pass = all(c.get("duration_ms") is None or c.get("duration_ms", 0) <= 5500 for c in motion_checks)
+    action_ratio = action_pass_count / max(len(actions), 1) if actions else (1.0 if natural_motion else 0.0)
     score = (
-        0.50 * (1.0 if motion_pass else 0.0)
-        + 0.30 * min(avg_quality / 0.72, 1.0)
+        0.55 * action_ratio
+        + 0.20 * min(avg_quality / 0.70, 1.0)
         + 0.10 * min(len(seen) / max(len(frames), 1), 1.0)
         + 0.10 * (1.0 if temporal_pass else 0.0)
+        + 0.05 * (1.0 if stage_timeout_pass else 0.0)
     )
-    passed = bool(score >= 0.58 and motion_pass and quality_pass and temporal_pass)
+    passed = bool(score >= 0.68 and motion_pass and quality_pass and temporal_pass and stage_timeout_pass)
     if passed:
         reason = "通过"
     elif static_replay:
         reason = "检测到重复静态帧，疑似照片/重放攻击"
+    elif not stage_timeout_pass:
+        reason = "单组动作超过 5 秒限制"
     elif not motion_pass:
         reason = "动作不符合随机挑战"
     else:
@@ -478,9 +625,12 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
         "avg_frame_diff": round(float(avg_frame_diff), 5),
         "seen_frames": len(seen),
         "total_frames": len(frames),
-        "observations": observations[-8:],
+        "action_pass_count": action_pass_count,
+        "required_action_count": len(actions),
+        "group_timeout_pass": bool(stage_timeout_pass),
+        "stage_count": len(stage_numbers) if stage_numbers else len(by_stage),
+        "observations": observations[-12:],
     }
-
 
 def analyze_emotion(face_img: np.ndarray) -> dict:
     if face_img is None or face_img.size == 0:

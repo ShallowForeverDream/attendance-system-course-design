@@ -45,6 +45,7 @@ python -m pip install -r requirements.txt
 ```powershell
 python scripts\prepare_demo.py --source ..\face_data
 python -m compileall .
+python scripts\liveness_stage_selftest.py
 python scripts\smoke_test.py
 python scripts\group_collage_selftest.py
 python scripts\group_collage_50_selftest.py

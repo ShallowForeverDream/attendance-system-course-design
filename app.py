@@ -33,6 +33,23 @@ from core.vision import (
     save_image,
 )
 
+LIVENESS_GROUP_COUNT = 3
+LIVENESS_GROUP_TIMEOUT_SECONDS = 5
+LIVENESS_CHALLENGE_TTL_SECONDS = 90
+LIVENESS_ACTION_LABELS = {
+    "move_left": "向屏幕左侧移动脸部",
+    "move_right": "向屏幕右侧移动脸部",
+    "move_closer": "靠近摄像头",
+    "move_away": "远离摄像头",
+    # 新增 5 个动态动作：上下移动、左右摆动、上下点头、远近变化。
+    "move_up": "向屏幕上方移动脸部",
+    "move_down": "向屏幕下方移动脸部",
+    "shake_left_right": "左右移动脸部一次",
+    "nod_up_down": "上下点头一次",
+    "zoom_in_out": "先靠近再远离摄像头",
+}
+LIVENESS_ACTION_POOL = list(LIVENESS_ACTION_LABELS.keys())
+
 
 def create_app() -> Flask:
     app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -134,10 +151,10 @@ def create_app() -> Flask:
             {"module": "架构要求", "point": "后端 API 规范", "score": 2, "route": "/api/*", "evidence": "统一 JSON 响应，错误信息可读"},
             {"module": "架构要求", "point": "数据库设计合理", "score": 2, "route": "core/db.py", "evidence": "学生、样本、考勤、情绪、活动、审计表互相关联"},
             {"module": "基础考勤", "point": "摄像头调用、人脸采集", "score": 3, "route": "考勤打卡", "evidence": "getUserMedia 实时视频"},
-            {"module": "基础考勤", "point": "手动/自动捕捉并显示状态", "score": 3, "route": "考勤打卡：手动抓拍预检 + 开始活体打卡", "evidence": "单帧手动预检不写入考勤；随机动作挑战分阶段自动采帧"},
+            {"module": "基础考勤", "point": "手动/自动捕捉并显示状态", "score": 3, "route": "考勤打卡：手动抓拍预检 + 开始活体打卡", "evidence": "单帧手动预检不写入考勤；3 组随机动作挑战，每组最多 5 秒，检测通过才进入下一组"},
             {"module": "基础考勤", "point": "实时渲染考勤结果", "score": 3, "route": "考勤结果框", "evidence": "姓名、学号、状态、时间、活体分、人脸分、情绪"},
             {"module": "基础考勤", "point": "筛选查询考勤记录", "score": 3, "route": "考勤记录", "evidence": "日期/学号筛选"},
-            {"module": "基础考勤", "point": "活体检测抗照片/视频", "score": 10, "route": "考勤打卡 + 安全自测", "evidence": "随机动作、多帧运动、重复帧检测、挑战过期"},
+            {"module": "基础考勤", "point": "活体检测抗照片/视频", "score": 10, "route": "考勤打卡 + 安全自测", "evidence": "9 种动作池、3 组限时挑战、多帧运动、重复帧检测、挑战过期"},
             {"module": "基础考勤", "point": "人脸库批量导入和增删改", "score": 2, "route": "学生/人脸库", "evidence": "新增、编辑、删除学生；查看/删除单个人脸样本；多文件上传样本；摄像头补采样本；face_data 批量导入"},
             {"module": "基础考勤", "point": "考勤数据记录和 Excel 导出", "score": 1, "route": "考勤记录/导出 Excel", "evidence": "attendance_records.xlsx"},
             {"module": "合照识别", "point": "上传合照并批量识别人脸", "score": 3, "route": "合照识别", "evidence": "检测人脸框、逐个匹配"},
@@ -146,7 +163,7 @@ def create_app() -> Flask:
             {"module": "情绪分析", "point": "考勤/合照同步提取情绪", "score": 5, "route": "考勤结果/合照结果", "evidence": "emotion_records"},
             {"module": "情绪分析", "point": "情绪统计结果", "score": 3, "route": "统计报表", "evidence": "按 scene/emotion 聚合"},
             {"module": "系统安全", "point": "照片攻击抵御", "score": 7, "route": "安全自测/活体失败结果", "evidence": "静态帧和动作不足失败"},
-            {"module": "系统安全", "point": "视频攻击抵御", "score": 8, "route": "随机挑战+过期机制", "evidence": "固定预录视频难以匹配实时随机动作"},
+            {"module": "系统安全", "point": "视频攻击抵御", "score": 8, "route": "随机挑战+过期机制", "evidence": "固定预录视频难以匹配 9 选 3 的动作顺序、5 秒分组限时和后端逐组判定"},
             {"module": "系统安全", "point": "教师/学生权限", "score": 3, "route": "教师/学生账号切换", "evidence": "学生仅可查看本人记录，教师可管理全部"},
             {"module": "报告源码", "point": "报告完整规范", "score": 20, "route": "docs/课程设计报告.docx + docs/课程设计报告.md", "evidence": "需求、系统设计、接口、算法、测试、结果、改进完整覆盖"},
             {"module": "报告源码", "point": "源码完整可部署", "score": 10, "route": "README.md", "evidence": "运行环境、部署步骤、依赖说明"},
@@ -372,18 +389,42 @@ def create_app() -> Flask:
     @app.get("/api/attendance/challenge")
     @require_login
     def attendance_challenge():
-        actions = random.sample(["move_left", "move_right", "move_closer", "move_away"], 2)
-        challenge = {"id": f"ch_{int(time.time())}_{random.randint(1000,9999)}", "actions": actions, "created_at": time.time()}
-        session["attendance_challenge"] = challenge
-        label = {
-            "move_left": "向屏幕左侧移动脸部",
-            "move_right": "向屏幕右侧移动脸部",
-            "move_closer": "靠近摄像头",
-            "move_away": "远离摄像头",
+        actions = random.sample(LIVENESS_ACTION_POOL, LIVENESS_GROUP_COUNT)
+        now = time.time()
+        challenge = {
+            "id": f"ch_{int(now)}_{random.randint(1000,9999)}",
+            "actions": actions,
+            "created_at": now,
+            "group_count": LIVENESS_GROUP_COUNT,
+            "group_timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
+            "ttl_seconds": LIVENESS_CHALLENGE_TTL_SECONDS,
         }
-        steps = [{"stage": 0, "action": "center", "label": "正对摄像头保持 1 秒"}]
-        steps += [{"stage": i, "action": a, "label": label[a]} for i, a in enumerate(actions, start=1)]
-        return jsonify({"ok": True, "challenge": {"id": challenge["id"], "steps": steps}})
+        session["attendance_challenge"] = challenge
+        steps = [
+            {
+                "stage": i,
+                "group": i,
+                "action": action,
+                "label": LIVENESS_ACTION_LABELS[action],
+                "timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
+                "hint": f"第 {i}/{LIVENESS_GROUP_COUNT} 组：请在 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒内完成动作，检测通过后自动进入下一组。",
+            }
+            for i, action in enumerate(actions, start=1)
+        ]
+        return jsonify({
+            "ok": True,
+            "challenge": {
+                "id": challenge["id"],
+                "steps": steps,
+                "group_count": LIVENESS_GROUP_COUNT,
+                "group_timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
+                "ttl_seconds": LIVENESS_CHALLENGE_TTL_SECONDS,
+                "available_actions": [
+                    {"action": action, "label": LIVENESS_ACTION_LABELS[action]}
+                    for action in LIVENESS_ACTION_POOL
+                ],
+            },
+        })
 
     @app.post("/api/attendance/check")
     @require_login
@@ -392,9 +433,10 @@ def create_app() -> Flask:
         payload = request.get_json(force=True)
         frames = payload.get("frames") or []
         ch = session.get("attendance_challenge") or {}
-        if not ch or payload.get("challenge_id") != ch.get("id") or time.time() - ch.get("created_at", 0) > 90:
+        ttl = ch.get("ttl_seconds", LIVENESS_CHALLENGE_TTL_SECONDS)
+        if not ch or payload.get("challenge_id") != ch.get("id") or time.time() - ch.get("created_at", 0) > ttl:
             return jsonify({"ok": False, "error": "活体挑战已过期，请重新开始"}), 400
-        if len(frames) < 5:
+        if len(frames) < LIVENESS_GROUP_COUNT * 4:
             return jsonify({"ok": False, "error": "采集帧数不足"}), 400
         live = analyze_liveness(frames, ch.get("actions", []))
         best_img, best_face, best_quality = None, None, -1.0
@@ -455,6 +497,47 @@ def create_app() -> Flask:
                 "time": now_iso(),
                 "note": "; ".join(note),
             },
+        })
+
+    @app.post("/api/attendance/liveness-stage")
+    @require_login
+    def attendance_liveness_stage():
+        """单组动作实时判定：前端检测到当前组动作通过后才进入下一组。"""
+        payload = request.get_json(force=True)
+        ch = session.get("attendance_challenge") or {}
+        ttl = ch.get("ttl_seconds", LIVENESS_CHALLENGE_TTL_SECONDS)
+        if not ch or payload.get("challenge_id") != ch.get("id") or time.time() - ch.get("created_at", 0) > ttl:
+            return jsonify({"ok": False, "error": "活体挑战已过期，请重新开始"}), 400
+        stage = int(payload.get("stage") or 0)
+        actions = ch.get("actions", [])
+        if stage < 1 or stage > len(actions):
+            return jsonify({"ok": False, "error": "无效的动作组"}), 400
+        frames = payload.get("frames") or []
+        if len(frames) < 3:
+            return jsonify({"ok": False, "error": "该组采集帧数不足"}), 400
+        elapsed_ms = float(payload.get("elapsed_ms") or 0)
+        if elapsed_ms > (LIVENESS_GROUP_TIMEOUT_SECONDS * 1000 + 800):
+            return jsonify({
+                "ok": True,
+                "stage_pass": False,
+                "reason": f"第 {stage} 组超过 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒限制",
+                "liveness": {"pass": False, "score": 0.0, "motion_checks": []},
+            })
+        action = actions[stage - 1]
+        for frame in frames:
+            frame["stage"] = 1
+        live = analyze_liveness(frames, [action])
+        check = (live.get("motion_checks") or [{}])[0]
+        # analyze_liveness 的最终 pass 还要求整体分数；单组实时判定以该组动作检查为准。
+        stage_pass = bool(check.get("ok") and live.get("seen_frames", 0) >= 3)
+        return jsonify({
+            "ok": True,
+            "stage_pass": stage_pass,
+            "stage": stage,
+            "action": action,
+            "label": LIVENESS_ACTION_LABELS.get(action, action),
+            "reason": "该组动作通过" if stage_pass else check.get("detail") or live.get("reason"),
+            "liveness": live,
         })
 
     @app.post("/api/attendance/preview")
@@ -586,10 +669,10 @@ def create_app() -> Flask:
                 raise ValueError("图片编码失败")
             b64 = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
             frames = []
-            for stage in (0, 1, 2):
+            for stage in range(1, LIVENESS_GROUP_COUNT + 1):
                 for _ in range(6):
                     frames.append({"stage": stage, "image": b64})
-            live = analyze_liveness(frames, ["move_left", "move_closer"])
+            live = analyze_liveness(frames, ["move_left", "move_closer", "shake_left_right"])
             with db() as conn:
                 log_action(conn, session.get("user_id"), "liveness_self_test", live)
             return jsonify({"ok": True, "attack": "static_photo_replay", "expected": "fail", "liveness": live})
@@ -615,8 +698,8 @@ def create_app() -> Flask:
             if not ok:
                 raise ValueError("样本图片编码失败")
             b64 = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
-            frames = [{"stage": stage, "image": b64} for stage in (0, 1, 2) for _ in range(6)]
-            live = analyze_liveness(frames, ["move_left", "move_closer"])
+            frames = [{"stage": stage, "image": b64} for stage in range(1, LIVENESS_GROUP_COUNT + 1) for _ in range(6)]
+            live = analyze_liveness(frames, ["move_left", "move_closer", "shake_left_right"])
             with db() as conn:
                 log_action(conn, session.get("user_id"), "liveness_self_test_sample", {
                     "student_no": sample["student_no"],
@@ -635,30 +718,40 @@ def create_app() -> Flask:
     @app.get("/api/security/challenge-randomness")
     @require_role("teacher")
     def challenge_randomness():
-        """生成多组虚拟挑战，现场展示随机动作和 90 秒过期机制如何提升视频重放难度。"""
+        """生成多组虚拟挑战，现场展示随机动作、3 组限时和 90 秒过期机制如何提升视频重放难度。"""
         from itertools import permutations
-        action_pool = ["move_left", "move_right", "move_closer", "move_away"]
-        label = {
-            "move_left": "向屏幕左侧移动脸部",
-            "move_right": "向屏幕右侧移动脸部",
-            "move_closer": "靠近摄像头",
-            "move_away": "远离摄像头",
-        }
         challenges = []
-        for i, actions in enumerate(permutations(action_pool, 2), start=1):
+        all_sequences = permutations(LIVENESS_ACTION_POOL, LIVENESS_GROUP_COUNT)
+        for i, actions in enumerate(all_sequences, start=1):
+            if i > 24:
+                break
             challenges.append({
                 "index": i,
                 "actions": list(actions),
-                "labels": [label[a] for a in actions],
+                "labels": [LIVENESS_ACTION_LABELS[a] for a in actions],
             })
+        total_sequences = 1
+        for n in range(len(LIVENESS_ACTION_POOL), len(LIVENESS_ACTION_POOL) - LIVENESS_GROUP_COUNT, -1):
+            total_sequences *= n
         unique = {"+".join(c["actions"]) for c in challenges}
         return jsonify({
             "ok": True,
             "generated": len(challenges),
+            "total_sequences": total_sequences,
             "unique_pairs": len(unique),
-            "ttl_seconds": 90,
+            "unique_sequences": total_sequences,
+            "action_count": len(LIVENESS_ACTION_POOL),
+            "group_count": LIVENESS_GROUP_COUNT,
+            "group_timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
+            "ttl_seconds": LIVENESS_CHALLENGE_TTL_SECONDS,
+            "actions": [
+                {"action": action, "label": LIVENESS_ACTION_LABELS[action]}
+                for action in LIVENESS_ACTION_POOL
+            ],
             "challenges": challenges,
-            "explain": "正式考勤挑战写入 session 并 90 秒过期；固定预录视频无法提前覆盖随机动作顺序和实时多帧运动检查。",
+            "explain": f"正式考勤每次从 {len(LIVENESS_ACTION_POOL)} 个动作中随机抽取 {LIVENESS_GROUP_COUNT} 组，"
+                       f"每组最多 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒，检测到当前动作才进入下一组；"
+                       f"整次挑战写入 session 并 {LIVENESS_CHALLENGE_TTL_SECONDS} 秒过期。固定预录视频难以提前覆盖随机动作顺序、限时响应和实时多帧运动检查。",
         })
 
     @app.post("/api/group/recognize")
@@ -884,7 +977,7 @@ def create_app() -> Flask:
             "## 兜底演示说明",
             "",
             "- 若现场摄像头权限或设备异常，可先用“安全自测 -> 无摄像头样本攻击自测”证明照片/重复帧攻击被拒绝。",
-            "- 若要展示视频重放防护逻辑，可点击“安全自测 -> 展示随机挑战抗视频”，查看随机动作组合与 90 秒过期机制。",
+            "- 若要展示视频重放防护逻辑，可点击“安全自测 -> 展示随机挑战抗视频”，查看 9 种动作池、3 组限时挑战、每组 5 秒上限与 90 秒过期机制。",
             "- 正式考勤仍建议使用“考勤打卡 -> 开启摄像头 -> 手动抓拍预检 -> 开始活体打卡”完整演示。",
         ]
         content = "\n".join(lines)

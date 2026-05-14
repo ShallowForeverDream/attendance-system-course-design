@@ -56,8 +56,8 @@ python app.py
 |---|---|
 | BS 分层架构 | `templates/static` 前端、`app.py/core` 后端、SQLite 数据库 |
 | 摄像头采集 | `static/js/app.js` 使用 `navigator.mediaDevices.getUserMedia()` |
-| 手动/自动捕捉 | “手动抓拍预检”可做单帧质量/识别/情绪预检；“开始活体打卡”按随机动作分段自动采集多帧 |
-| 活体检测 | `analyze_liveness()`：随机动作挑战 + 多帧人脸质量/纹理检测 |
+| 手动/自动捕捉 | “手动抓拍预检”可做单帧质量/识别/情绪预检；“开始活体打卡”按 3 组随机动作自动采集多帧，每组最多 5 秒，检测到动作才进入下一组 |
+| 活体检测 | `analyze_liveness()`：9 种动作池 + 3 组限时挑战 + 多帧人脸质量/纹理/运动检测 |
 | 人脸库 | 学生 CRUD + 查看/删除单个人脸样本 + 多人脸样本上传 + `face_data` 批量导入 + 摄像头补采样本 |
 | 考勤记录 | `attendance_records` 表，支持筛选与 Excel 导出 |
 | 合照识别 | 上传合照，批量检测人脸、逐个匹配人脸库、生成标注图和名单 |
@@ -69,7 +69,7 @@ python app.py
 ## 4.1 现场兜底演示
 
 - 如果现场摄像头被浏览器权限、教室设备或投屏环境影响，可在“安全自测”点击 **无摄像头样本攻击自测**，系统会用已入库样本构造静态照片/重复帧攻击并证明活体检测拒绝。
-- 如果老师追问“如何抵御预录视频”，点击 **展示随机挑战抗视频**，可直接展示多组随机动作挑战、90 秒过期和多帧运动检查逻辑。
+- 如果老师追问“如何抵御预录视频”，点击 **展示随机挑战抗视频**，可直接展示 9 种动作池、3 组随机挑战、每组 5 秒限时、90 秒过期和多帧运动检查逻辑。
 - “手动抓拍预检”只用于证明前端支持手动拍摄与实时反馈，不写入考勤；正式考勤必须通过随机动作活体检测，避免手动单帧绕过安全逻辑。
 
 ## 5. 老师照片数据导入与稳定合照演示
@@ -120,6 +120,7 @@ attendance_system/
 ```powershell
 python scripts\prepare_demo.py
 python -m compileall .
+python scripts\liveness_stage_selftest.py
 python scripts\smoke_test.py
 python scripts\group_collage_selftest.py
 python scripts\group_collage_50_selftest.py

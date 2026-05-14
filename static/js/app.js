@@ -80,13 +80,13 @@ async function startCamera() {
 }
 $('#startCameraBtn').addEventListener('click', startCamera);
 
-function captureFrame(stage) {
+function captureFrame(stage, extra = {}) {
   const video = $('#video');
   const canvas = $('#captureCanvas');
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  return {stage, image: canvas.toDataURL('image/jpeg', 0.82)};
+  return {stage, image: canvas.toDataURL('image/jpeg', 0.82), ...extra};
 }
 
 $('#manualCaptureBtn')?.addEventListener('click', async () => {
@@ -112,14 +112,67 @@ $('#manualCaptureBtn')?.addEventListener('click', async () => {
 });
 
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-async function captureStage(stage, seconds = 1.3) {
+function actionGuide(action) {
+  const guides = {
+    move_left: '保持脸在画面内，平移到屏幕左侧。',
+    move_right: '保持脸在画面内，平移到屏幕右侧。',
+    move_closer: '脸部慢慢靠近摄像头，让人脸框变大。',
+    move_away: '脸部慢慢远离摄像头，让人脸框变小。',
+    move_up: '脸部向屏幕上方移动，不要离开画面。',
+    move_down: '脸部向屏幕下方移动，不要离开画面。',
+    shake_left_right: '从左到右或从右到左移动一次，幅度要明显。',
+    nod_up_down: '上下点头一次，幅度要明显。',
+    zoom_in_out: '先靠近再远离，保持脸始终在画面内。'
+  };
+  return guides[action] || '按屏幕提示完成动作。';
+}
+
+async function captureStageUntilPass(challenge, step, allFrames) {
+  const timeoutMs = (step.timeout_seconds || challenge.group_timeout_seconds || 5) * 1000;
+  const startedAt = performance.now();
   const frames = [];
-  const count = 6;
-  for (let i = 0; i < count; i++) {
-    frames.push(captureFrame(stage));
-    await wait(seconds * 1000 / count);
+  let lastCheckAt = 0;
+  let lastReason = '等待动作变化...';
+
+  while (performance.now() - startedAt < timeoutMs) {
+    const elapsed = performance.now() - startedAt;
+    const frame = captureFrame(step.stage, {
+      action: step.action,
+      stage_elapsed_ms: Math.round(elapsed),
+      captured_at_ms: Date.now()
+    });
+    frames.push(frame);
+    allFrames.push(frame);
+
+    const remain = Math.max(0, Math.ceil((timeoutMs - elapsed) / 1000));
+    $('#attendanceMsg').textContent =
+      `${step.hint || `第 ${step.group}/${challenge.group_count} 组`}\n` +
+      `动作：${step.label}\n提示：${actionGuide(step.action)}\n` +
+      `剩余：${remain} 秒\n状态：${lastReason}`;
+
+    if (frames.length >= 4 && performance.now() - lastCheckAt > 650) {
+      lastCheckAt = performance.now();
+      try {
+        const data = await api('/api/attendance/liveness-stage', {
+          method: 'POST',
+          body: JSON.stringify({
+            challenge_id: challenge.id,
+            stage: step.stage,
+            elapsed_ms: Math.round(performance.now() - startedAt),
+            frames
+          })
+        });
+        lastReason = data.reason || '正在检测动作...';
+        if (data.stage_pass) {
+          return {ok: true, frames, reason: data.reason};
+        }
+      } catch (err) {
+        lastReason = err.message;
+      }
+    }
+    await wait(260);
   }
-  return frames;
+  return {ok: false, frames, reason: `第 ${step.group || step.stage} 组动作未在 ${Math.round(timeoutMs / 1000)} 秒内完成：${lastReason}`};
 }
 
 $('#startCheckBtn').addEventListener('click', async () => {
@@ -128,14 +181,22 @@ $('#startCheckBtn').addEventListener('click', async () => {
   try {
     const challenge = (await api('/api/attendance/challenge')).challenge;
     const stepsEl = $('#challengeSteps');
-    stepsEl.innerHTML = challenge.steps.map(s => `<li data-stage="${s.stage}">${escapeHtml(s.label)}</li>`).join('');
+    stepsEl.innerHTML = challenge.steps.map(s =>
+      `<li data-stage="${s.stage}"><strong>第 ${s.group}/${challenge.group_count} 组</strong>：${escapeHtml(s.label)} <span class="small">≤${s.timeout_seconds}s</span></li>`
+    ).join('');
     const frames = [];
     for (const step of challenge.steps) {
       $$('li', stepsEl).forEach(li => li.classList.toggle('active', Number(li.dataset.stage) === step.stage));
-      $('#attendanceMsg').textContent = `请执行：${step.label}\n系统正在采集第 ${step.stage + 1}/${challenge.steps.length} 段...`;
-      await wait(450);
-      frames.push(...await captureStage(step.stage));
+      $('#attendanceMsg').textContent = `${step.hint}\n动作：${step.label}\n提示：${actionGuide(step.action)}`;
+      await wait(300);
+      const stageResult = await captureStageUntilPass(challenge, step, frames);
+      if (!stageResult.ok) {
+        $(`li[data-stage="${step.stage}"]`, stepsEl)?.classList.add('failed');
+        throw new Error(stageResult.reason + '\n请重新开始活体打卡。');
+      }
       $(`li[data-stage="${step.stage}"]`, stepsEl)?.classList.add('done');
+      $('#attendanceMsg').textContent = `第 ${step.group}/${challenge.group_count} 组已通过：${step.label}\n准备进入下一组...`;
+      await wait(450);
     }
     $('#attendanceMsg').textContent = '采集完成，正在后端进行活体检测、人脸比对与情绪分析...';
     const data = await api('/api/attendance/check', {method: 'POST', body: JSON.stringify({challenge_id: challenge.id, frames})});
@@ -378,8 +439,10 @@ $('#randomnessBtn')?.addEventListener('click', async () => {
     const data = await api('/api/security/challenge-randomness');
     $('#securityResult').className = 'result-box ok';
     $('#securityResult').textContent =
-      `随机挑战样例：${data.generated} 组，出现 ${data.unique_pairs} 种不同动作组合\n` +
-      `挑战有效期：${data.ttl_seconds} 秒\n\n` +
+      `动作池：${data.action_count} 种；每次随机抽取 ${data.group_count} 组\n` +
+      `组合空间：${data.total_sequences} 种有序挑战；下方展示前 ${data.generated} 组样例\n` +
+      `单组限时：${data.group_timeout_seconds} 秒；整次挑战有效期：${data.ttl_seconds} 秒\n\n` +
+      `动作池：${data.actions.map(a => a.label).join('、')}\n\n` +
       data.challenges.map(c => `${c.index}. ${c.labels.join(' -> ')}`).join('\n') +
       `\n\n说明：${data.explain}`;
   } catch (err) {

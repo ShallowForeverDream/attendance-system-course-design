@@ -56,6 +56,7 @@ video { width: 100%; aspect-ratio: 4/3; background: #111827; border-radius: 16px
 .steps { padding-left: 22px; color: var(--muted); line-height: 1.9; }
 .steps li.active { color: var(--primary); font-weight: 800; }
 .steps li.done { color: var(--ok); }
+.steps li.failed { color: var(--bad); font-weight: 800; }
 .result-box { min-height: 160px; padding: 16px; border-radius: 16px; background: #f8fafc; border: 1px dashed #cbd5e1; line-height: 1.75; white-space: pre-wrap; }
 .result-box.ok { border-color: #86efac; background: #f0fdf4; color: #166534; }
 .result-box.bad { border-color: #fca5a5; background: #fef2f2; color: #991b1b; }
