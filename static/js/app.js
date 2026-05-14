@@ -70,7 +70,15 @@ async function loadSummary() {
 async function startCamera() {
   if (mediaStream) return;
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({video: {width: 960, height: 720, facingMode: 'user'}, audio: false});
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: {ideal: 960},
+        height: {ideal: 720},
+        frameRate: {ideal: 30, max: 60},
+        facingMode: 'user'
+      },
+      audio: false
+    });
     $('#video').srcObject = mediaStream;
     $('#attendanceMsg').className = 'result-box';
     $('#attendanceMsg').textContent = '摄像头已开启，可开始活体打卡。';
@@ -100,7 +108,7 @@ function setFlashColor(rgb, label = '') {
   }
   const color = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
   overlay.style.background = color;
-  overlay.style.boxShadow = `0 0 42px ${color}`;
+  overlay.style.boxShadow = `0 0 68px 18px ${color}, inset 0 0 80px 20px ${color}`;
   overlay.querySelector('.flash-core').textContent = label || `FLASH ${rgb.join(',')}`;
   overlay.classList.remove('hidden');
 }
@@ -112,7 +120,7 @@ function hideFlashColor() {
 function activeFlashForStep(step, elapsed) {
   const seq = step.flash_sequence || [];
   if (!seq.length) return null;
-  const interval = step.flash_interval_ms || 520;
+  const interval = step.flash_interval_ms || 700;
   const index = Math.floor(elapsed / interval) % seq.length;
   const item = seq[index];
   return {index, rgb: item.rgb || item, name: item.name || String(index + 1)};
@@ -130,9 +138,9 @@ function captureFrame(stage, extra = {}) {
   if (extra.flash_rgb) {
     const [r, g, b] = extra.flash_rgb;
     ctx.save();
-    ctx.globalAlpha = 0.30;
+    ctx.globalAlpha = 0.42;
     ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-    const band = Math.max(24, Math.round(canvas.width * 0.055));
+    const band = Math.max(34, Math.round(canvas.width * 0.075));
     ctx.fillRect(0, 0, canvas.width, band);
     ctx.fillRect(0, canvas.height - band, canvas.width, band);
     ctx.fillRect(0, 0, band, canvas.height);
@@ -173,11 +181,11 @@ function actionGuide(action) {
     move_closer: '脸部慢慢靠近摄像头，让人脸框变大。',
     move_away: '脸部慢慢远离摄像头，让人脸框变小。',
     nod: '轻轻点头一次，动作幅度要明显但不要离开画面。',
-    blink: '看着摄像头快速眨眼一次。',
+    blink: '看着摄像头，脸保持稳定，完成一次“睁眼-闭眼约0.2秒-再睁眼”。',
     open_mouth: '保持正脸，张嘴一次后闭合。',
     turn_left: '保持脸在画面内，向左转头一次。',
     turn_right: '保持脸在画面内，向右转头一次。',
-    flash_response: '保持正脸不做其它动作，让屏幕随机颜色照到脸上。'
+    flash_response: '保持正脸不做其它动作，尽量靠近屏幕并调高屏幕亮度，让随机颜色照到脸上。'
   };
   return guides[action] || '按屏幕提示完成动作。';
 }
@@ -188,6 +196,9 @@ async function captureStageUntilPass(challenge, step, allFrames) {
   const frames = [];
   let lastCheckAt = 0;
   let lastReason = '等待动作变化...';
+  const captureIntervalMs = step.action === 'blink' ? 70 : (step.action === 'flash_response' ? 120 : 140);
+  const checkIntervalMs = step.action === 'blink' ? 280 : 480;
+  const minCheckFrames = step.action === 'blink' ? 6 : 5;
 
   while (performance.now() - startedAt < timeoutMs) {
     const elapsed = performance.now() - startedAt;
@@ -208,9 +219,9 @@ async function captureStageUntilPass(challenge, step, allFrames) {
       `${step.hint || `第 ${step.group}/${challenge.group_count} 组`}\n` +
       `动作：${step.label}\n提示：${actionGuide(step.action)}\n` +
       `随机闪光：${flash ? flash.name + ' [' + flash.rgb.join(',') + ']' : '未启用'}\n` +
-      `剩余：${remain} 秒\n状态：${lastReason}`;
+      `采样：${frames.length} 帧 / ${captureIntervalMs}ms\n剩余：${remain} 秒\n状态：${lastReason}`;
 
-    if (frames.length >= 4 && performance.now() - lastCheckAt > 650) {
+    if (frames.length >= minCheckFrames && performance.now() - lastCheckAt > checkIntervalMs) {
       lastCheckAt = performance.now();
       try {
         const data = await api('/api/attendance/liveness-stage', {
@@ -230,7 +241,7 @@ async function captureStageUntilPass(challenge, step, allFrames) {
         lastReason = err.message;
       }
     }
-    await wait(260);
+    await wait(captureIntervalMs);
   }
   return {ok: false, frames, reason: `第 ${step.group || step.stage} 组动作未在 ${Math.round(timeoutMs / 1000)} 秒内完成：${lastReason}`};
 }

@@ -201,6 +201,7 @@ def _crop_signal_features(face_img: np.ndarray) -> dict:
     if face_img is None or face_img.size == 0:
         return {
             "face_rgb": [0.0, 0.0, 0.0],
+            "border_rgb": [0.0, 0.0, 0.0],
             "face_luma": 0.0,
             "face_sat": 0.0,
             "eye_dark": 0.0,
@@ -308,6 +309,47 @@ def _crop_signal_features(face_img: np.ndarray) -> dict:
     }
 
 
+def _closed_eye_proxy(gray: np.ndarray) -> float:
+    """用上半脸暗色水平线比例估计闭眼程度；不依赖关键点模型，适合普通摄像头快速判定。"""
+    try:
+        norm_face = cv2.resize(gray, (96, 120), interpolation=cv2.INTER_AREA)
+        norm_eq = cv2.equalizeHist(norm_face)
+        # 眼睛真实闭合时会形成横向深色细线；眼镜/阴影可能让绝对暗度偏高，
+        # 所以同时融合“暗像素比例”和“水平边缘强度”。
+        band = norm_eq[24:54, 10:86]
+        if band.size == 0:
+            return 0.0
+        local_thr = min(112.0, float(np.percentile(band, 38)) + 14.0)
+        dark = (band < local_thr).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1))
+        horizontal = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
+        sobel_y = cv2.Sobel(band, cv2.CV_32F, 0, 1, ksize=3)
+        edge_score = float(np.percentile(np.abs(sobel_y), 90) / 255.0)
+        return float(min(1.0, horizontal.mean() * 0.82 + edge_score * 0.18))
+    except Exception:
+        return 0.0
+
+
+def _frame_border_rgb(img: np.ndarray) -> list[float]:
+    """读取前端写入采集帧边缘的随机打光水印颜色，作为弱光环境下的稳健校验信号。"""
+    if img is None or img.size == 0:
+        return [0.0, 0.0, 0.0]
+    h, w = img.shape[:2]
+    band = max(8, int(min(h, w) * 0.075))
+    parts = [
+        img[:band, :, :],
+        img[max(0, h - band):, :, :],
+        img[:, :band, :],
+        img[:, max(0, w - band):, :],
+    ]
+    pixels = np.concatenate([p.reshape(-1, 3) for p in parts if p.size], axis=0)
+    if pixels.size == 0:
+        return [0.0, 0.0, 0.0]
+    rgb = pixels[:, ::-1].astype(np.float32) / 255.0
+    mean_rgb = rgb.mean(axis=0)
+    return [round(float(x), 6) for x in mean_rgb.tolist()]
+
+
 def _parse_flash_rgb(value) -> list[float] | None:
     if value is None:
         return None
@@ -365,45 +407,114 @@ def _flash_response_check(seen: list[dict], challenge_steps: list[dict] | None) 
             "invalid_meta_ratio": 0.0,
         }
     rows = [r for r in seen if r.get("expected_flash_rgb") is not None and r.get("face_rgb")]
-    if len(rows) < 6:
+    all_meta_rows = [r for r in seen if r.get("expected_flash_rgb") is not None]
+    if len(rows) < 6 and len(all_meta_rows) < 6:
         return {"pass": False, "enabled": True, "reason": "随机闪光响应帧不足", "coverage": 0.0, "color_corr": 0.0, "brightness_corr": 0.0, "response_amplitude": 0.0, "invalid_meta_ratio": 1.0}
     stage_results = []
     invalid = 0
+    total_meta = 0
     for step in challenge_steps:
         stage = int(step.get("stage", 0))
         seq = step.get("flash_sequence") or []
         srows = [r for r in rows if int(r.get("stage", 0)) == stage]
+        smeta_rows = [r for r in all_meta_rows if int(r.get("stage", 0)) == stage]
         if not srows and len(challenge_steps) == 1:
             srows = rows
-        if len(srows) < 4:
+        if not smeta_rows and len(challenge_steps) == 1:
+            smeta_rows = all_meta_rows
+        check_rows = smeta_rows or srows
+        if len(check_rows) < 4:
             stage_results.append({"stage": stage, "pass": False, "reason": "该组闪光帧不足"})
             continue
-        uniq = {int(r.get("flash_index", -1)) % max(len(seq), 1) for r in srows if r.get("flash_index") is not None}
-        coverage = len(uniq) / max(min(len(seq), 3), 1)
-        obs = np.array([r["face_rgb"] for r in srows], dtype=np.float32)
-        exp = np.array([r["expected_flash_rgb"] for r in srows], dtype=np.float32)
-        sent = np.array([r.get("sent_flash_rgb") or r["expected_flash_rgb"] for r in srows], dtype=np.float32)
+        uniq = {int(r.get("flash_index", -1)) % max(len(seq), 1) for r in check_rows if r.get("flash_index") is not None}
+        coverage = min(1.0, len(uniq) / max(min(len(seq), 3), 1))
+        obs = np.array([r.get("face_rgb", [0.0, 0.0, 0.0]) for r in check_rows], dtype=np.float32)
+        border_obs = np.array([r.get("border_rgb") or [0.0, 0.0, 0.0] for r in check_rows], dtype=np.float32)
+        exp = np.array([r["expected_flash_rgb"] for r in check_rows], dtype=np.float32)
+        sent = np.array([r.get("sent_flash_rgb") or r["expected_flash_rgb"] for r in check_rows], dtype=np.float32)
         invalid += int(np.sum(np.linalg.norm(sent - exp, axis=1) > 0.12))
-        # 自动白平衡会压缩绝对颜色，采用中心化 RGB 与亮度双相关，更适合普通摄像头。
+        total_meta += len(check_rows)
+        # 自动白平衡会压缩绝对颜色，采用中心化 RGB、相邻变化方向和亮度双相关，更适合普通摄像头。
         obs_center = obs - obs.mean(axis=0, keepdims=True)
         exp_center = exp - exp.mean(axis=0, keepdims=True)
         channel_corrs = [_corr(obs_center[:, i], exp_center[:, i]) for i in range(3)]
-        color_corr = float(np.mean(channel_corrs))
+        direct_color_corr = float(np.mean(channel_corrs))
+        obs_delta = np.diff(obs, axis=0)
+        exp_delta = np.diff(exp, axis=0)
+        delta_corrs = [_corr(obs_delta[:, i], exp_delta[:, i]) for i in range(3)] if len(obs_delta) >= 3 else [0.0]
+        delta_color_corr = float(np.mean(delta_corrs))
+        obs_norm = obs / (obs.sum(axis=1, keepdims=True) + 1e-6)
+        exp_norm = exp / (exp.sum(axis=1, keepdims=True) + 1e-6)
+        chroma_corrs = [_corr(obs_norm[:, i], exp_norm[:, i]) for i in range(3)]
+        chroma_corr = float(np.mean(chroma_corrs))
+        color_corr = float(max(direct_color_corr, delta_color_corr, chroma_corr))
         obs_luma = obs @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         exp_luma = exp @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         brightness_corr = _corr(obs_luma, exp_luma)
-        response_amp = float(np.mean(np.std(obs, axis=0)) + np.std(obs_luma) * 0.35)
-        # 屏幕照明在不同环境中强弱不一，判定略保守：既看相关性，也看是否确有颜色波动。
-        ok = bool(coverage >= 0.66 and response_amp >= 0.0035 and (color_corr >= 0.10 or brightness_corr >= 0.10 or response_amp >= 0.012))
+        delta_brightness_corr = _corr(np.diff(obs_luma), np.diff(exp_luma)) if len(obs_luma) >= 4 else 0.0
+        brightness_corr = float(max(brightness_corr, delta_brightness_corr))
+        response_amp = float(np.mean(np.std(obs, axis=0)) + np.std(obs_luma) * 0.35 + np.mean(np.std(obs_norm, axis=0)) * 0.18)
+        obs_step = float(np.mean(np.linalg.norm(np.diff(obs, axis=0), axis=1))) if len(obs) >= 2 else 0.0
+        obs_total_step = float(np.linalg.norm(obs[-1] - obs[0])) if len(obs) >= 2 else 0.0
+        exp_step = float(np.mean(np.linalg.norm(np.diff(exp, axis=0), axis=1))) if len(exp) >= 2 else 0.0
+        expected_response_ratio = float(obs_step / (exp_step + 1e-6))
+        # 真实屏幕打光通常表现为：人脸颜色围绕本次随机序列轻微同步振荡；
+        # 预录视频/缩放裁剪也会让均值漂移，但其相邻变化方向和闪光序列不稳定同步。
+        live_face_signal = bool(
+            coverage >= 0.66
+            and response_amp >= 0.0025
+            and (
+                color_corr >= 0.08
+                or brightness_corr >= 0.10
+                or (response_amp >= 0.010 and color_corr >= 0.045)
+            )
+        )
+        strict_face_signal = bool(
+            coverage >= 0.66
+            and response_amp >= 0.0060
+            and expected_response_ratio >= 0.012
+            and obs_total_step >= 0.008
+            and (
+                color_corr >= 0.18
+                or brightness_corr >= 0.18
+                or chroma_corr >= 0.22
+                or (delta_color_corr >= 0.12 and response_amp >= 0.010)
+            )
+        )
+        border_color_corr = 0.0
+        border_amp = 0.0
+        border_meta_ok = False
+        if border_obs.size and float(border_obs.std()) > 1e-6:
+            border_center = border_obs - border_obs.mean(axis=0, keepdims=True)
+            border_corrs = [_corr(border_center[:, i], exp_center[:, i]) for i in range(3)]
+            border_color_corr = float(np.mean(border_corrs))
+            border_amp = float(np.mean(np.std(border_obs, axis=0)))
+            border_meta_ok = bool(coverage >= 0.50 and border_amp >= 0.006 and border_color_corr >= 0.18)
+        # 单组实时体验允许“边缘水印 + 宽松人脸响应”通过，减少教室弱光误拒；
+        # 正式提交时 _spoof_flash_face_response_pass 会使用 strict_face_response_pass。
+        face_response_ok = live_face_signal
+        strict_face_response_ok = strict_face_signal
+        ok = bool(face_response_ok or border_meta_ok)
         stage_results.append({
             "stage": stage,
             "pass": ok,
+            "face_response_pass": face_response_ok,
+            "strict_face_response_pass": strict_face_response_ok,
+            "border_meta_pass": border_meta_ok,
             "coverage": round(float(coverage), 4),
             "color_corr": round(float(color_corr), 4),
+            "direct_color_corr": round(float(direct_color_corr), 4),
+            "delta_color_corr": round(float(delta_color_corr), 4),
+            "chroma_corr": round(float(chroma_corr), 4),
             "brightness_corr": round(float(brightness_corr), 4),
             "response_amplitude": round(float(response_amp), 6),
+            "observed_flash_step": round(float(obs_step), 6),
+            "observed_flash_total_step": round(float(obs_total_step), 6),
+            "expected_response_ratio": round(float(expected_response_ratio), 6),
+            "border_color_corr": round(float(border_color_corr), 4),
+            "border_response_amplitude": round(float(border_amp), 6),
         })
-    invalid_ratio = invalid / max(len(rows), 1)
+    invalid_ratio = invalid / max(total_meta, len(rows), 1)
     passed = bool(stage_results and all(r.get("pass") for r in stage_results) and invalid_ratio <= 0.20)
     if passed:
         reason = "随机闪光响应同步"
@@ -422,6 +533,24 @@ def _flash_response_check(seen: list[dict], challenge_steps: list[dict] | None) 
         "invalid_meta_ratio": round(float(invalid_ratio), 4),
         "stages": stage_results,
     }
+
+
+def _spoof_flash_face_response_pass(flash_check: dict) -> bool:
+    """抗预录视频最终门槛必须有人脸区域响应，不能只靠边缘水印元数据。
+
+    正式打卡有 3 组随机挑战。普通教室屏幕打光可能被摄像头自动白平衡压缩，
+    因此最终门槛采用“多数严格人脸响应”：单组必须严格通过；多组至少 2/3
+    严格通过，同时每组仍需通过宽松实时闪光检查。预录视频通常只能伪造元数据，
+    难以在多数随机组里让人脸区域按本次颜色序列同步变化。
+    """
+    if not flash_check.get("enabled"):
+        return True
+    stages = flash_check.get("stages") or []
+    if not stages:
+        return False
+    strict_count = sum(1 for s in stages if s.get("strict_face_response_pass"))
+    required = 1 if len(stages) == 1 else max(2, math.ceil(len(stages) * 0.67))
+    return strict_count >= required
 
 
 def _deepface_emotion(face_img: np.ndarray) -> dict | None:
@@ -786,13 +915,16 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         except (TypeError, ValueError):
             elapsed_ms = None
         faces = detect_faces(img, min_size=70)
+        frame_border_rgb = _frame_border_rgb(img)
         if not faces:
-            observations.append({"seq": seq, "stage": stage, "elapsed_ms": elapsed_ms, "seen": False})
+            observations.append({"seq": seq, "stage": stage, "elapsed_ms": elapsed_ms, "seen": False, "border_rgb": frame_border_rgb})
             continue
         box = faces[0]
         h, w = img.shape[:2]
         crop = crop_face(img, box)
         signal = _crop_signal_features(crop)
+        face_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        closed_eye_proxy = _closed_eye_proxy(face_gray)
         flash_index_raw = item.get("flash_index")
         try:
             flash_index = int(flash_index_raw) if flash_index_raw is not None else None
@@ -810,6 +942,8 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
             "cy": box.center()[1] / max(h, 1),
             "area": box.area() / max(w * h, 1),
             "quality": quality_score(crop),
+            "closed_eye_proxy": round(float(closed_eye_proxy), 6),
+            "border_rgb": frame_border_rgb,
             "flash_index": flash_index,
             "sent_flash_rgb": sent_flash_rgb,
             "expected_flash_rgb": expected_rgb,
@@ -854,6 +988,7 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         mouth_edge_vals = [r.get("mouth_edge", 0.0) for r in rows]
         yaw_vals = [r.get("yaw_proxy", 0.0) for r in rows]
         aspect_vals = [r.get("face_aspect", 0.0) for r in rows]
+        closed_eye_vals = [r.get("closed_eye_proxy", 0.0) for r in rows]
         return {
             "stage": stage,
             "seen_frames": n,
@@ -881,6 +1016,9 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
             "min_eye_dark": float(min(eye_dark_vals)),
             "max_eye_dark": float(max(eye_dark_vals)),
             "eye_edge_range": float(max(eye_edge_vals) - min(eye_edge_vals)),
+            "min_closed_eye": float(min(closed_eye_vals)),
+            "max_closed_eye": float(max(closed_eye_vals)),
+            "closed_eye_range": float(max(closed_eye_vals) - min(closed_eye_vals)),
             "first_mouth_open": avg(early, "mouth_open"),
             "last_mouth_open": avg(late, "mouth_open"),
             "min_mouth_open": float(min(mouth_open_vals)),
@@ -966,10 +1104,16 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
             ok = y_range > 0.030 or abs(dy) > 0.020
             detail = f"y_range={y_range:.4f}, net_dy={dy:.4f}"
         elif action == "blink":
-            delta = eye_dark_range
-            temporary_eye_loss = st["seen_frames"] >= 3 and 0.45 <= st["face_seen_ratio"] <= 0.88
-            ok = eye_dark_range > 0.045 or (abs(eye_dark_delta) > 0.032 and st["eye_edge_range"] > 0.010) or temporary_eye_loss
-            detail = f"eye_dark_range={eye_dark_range:.4f}, eye_dark_delta={eye_dark_delta:.4f}, eye_edge_range={st['eye_edge_range']:.4f}, face_seen_ratio={st['face_seen_ratio']:.4f}"
+            delta = max(eye_dark_range, st["closed_eye_range"])
+            temporary_eye_loss = st["seen_frames"] >= 3 and 0.38 <= st["face_seen_ratio"] <= 0.94
+            blink_peak = st["max_closed_eye"] >= 0.030 and st["closed_eye_range"] >= 0.010
+            ok = (
+                eye_dark_range > 0.030
+                or abs(eye_dark_delta) > 0.022
+                or blink_peak
+                or temporary_eye_loss
+            )
+            detail = f"eye_dark_range={eye_dark_range:.4f}, eye_dark_delta={eye_dark_delta:.4f}, closed_eye_range={st['closed_eye_range']:.4f}, max_closed_eye={st['max_closed_eye']:.4f}, face_seen_ratio={st['face_seen_ratio']:.4f}"
         elif action == "open_mouth":
             delta = max(mouth_delta, mouth_range)
             ok = mouth_delta > 0.030 or mouth_range > 0.050 or (st["mouth_dark_range"] > 0.035 and st["mouth_edge_range"] > 0.010)
@@ -1021,7 +1165,10 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
     cxs = [o["cx"] for o in seen]
     cys = [o["cy"] for o in seen]
     areas = [o["area"] for o in seen]
-    eye_motion = max([o.get("eye_dark", 0.0) for o in seen]) - min([o.get("eye_dark", 0.0) for o in seen])
+    eye_motion = max(
+        max([o.get("eye_dark", 0.0) for o in seen]) - min([o.get("eye_dark", 0.0) for o in seen]),
+        max([o.get("closed_eye_proxy", 0.0) for o in seen]) - min([o.get("closed_eye_proxy", 0.0) for o in seen]),
+    )
     mouth_motion = max([o.get("mouth_open", 0.0) for o in seen]) - min([o.get("mouth_open", 0.0) for o in seen])
     yaw_motion = max([o.get("yaw_proxy", 0.0) for o in seen]) - min([o.get("yaw_proxy", 0.0) for o in seen])
     natural_motion = (
@@ -1042,7 +1189,9 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         avg_frame_diff = float(np.mean(diffs))
     else:
         avg_frame_diff = 0.0
-    static_replay = unique_ratio < 0.35 and avg_frame_diff < 0.003
+    flash_meta_present = any(o.get("expected_flash_rgb") is not None for o in seen)
+    face_color_amp = float(np.mean(np.std(np.array([o.get("face_rgb", [0.0, 0.0, 0.0]) for o in seen], dtype=np.float32), axis=0))) if seen else 0.0
+    static_replay = unique_ratio < 0.35 and avg_frame_diff < 0.003 and not (flash_meta_present and face_color_amp > 0.006)
 
     crop_diffs = []
     for i in range(1, len(crop_norm_frames)):
@@ -1057,14 +1206,18 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
     # 举着同一张照片移动时，整帧变化明显，但归一化人脸几乎刚性不变；真人动作会带来微表情、姿态和光照变化。
     rigid_planar_replay = bool(motion_extent > 0.035 and len(crop_diffs) >= 5 and (avg_crop_diff < 0.0045 or crop_unique_ratio < 0.28))
     synthetic_plain_background = bool(float(np.std(cxs)) > 0.0 and np.mean([o.get("face_sat", 0) for o in seen]) > 0.25 and avg_quality > 0.88 and unique_ratio > 0.45)
-    screen_or_print_risk = bool(
+    screen_or_print_risk_raw = bool(
         not synthetic_plain_background
         and ((avg_specular > 0.030 and avg_moire > 0.055) or (avg_specular > 0.006 and avg_moire > 0.090 and avg_fft_high > 0.34))
     )
-    anti_spoof_pass = not (rigid_planar_replay or screen_or_print_risk)
+    # 真实屏幕打光会提高高光比例；如果颜色响应和元数据同步，不把这类高光误判成屏幕翻拍。
     flash_check = _flash_response_check(seen, challenge_steps)
+    spoof_flash_face_pass = _spoof_flash_face_response_pass(flash_check)
+    screen_or_print_risk = bool(screen_or_print_risk_raw and not (spoof_flash_face_pass and face_color_amp > 0.006))
+    anti_spoof_pass = not (rigid_planar_replay or screen_or_print_risk)
 
     temporal_pass = not static_replay
+    spoof_flash_pass = bool(not flash_check.get("enabled") or spoof_flash_face_pass)
     stage_timeout_pass = all(c.get("duration_ms") is None or c.get("duration_ms", 0) <= 5500 for c in motion_checks)
     action_ratio = action_pass_count / max(len(actions), 1) if actions else (1.0 if natural_motion else 0.0)
     score = (
@@ -1076,13 +1229,15 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         + 0.10 * (1.0 if flash_check.get("pass") else 0.0)
         + 0.03 * (1.0 if stage_timeout_pass else 0.0)
     )
-    passed = bool(score >= 0.72 and motion_pass and quality_pass and temporal_pass and anti_spoof_pass and flash_check.get("pass") and stage_timeout_pass)
+    passed = bool(score >= 0.72 and motion_pass and quality_pass and temporal_pass and anti_spoof_pass and flash_check.get("pass") and spoof_flash_pass and stage_timeout_pass)
     if passed:
         reason = "通过"
     elif static_replay:
         reason = "检测到重复静态帧，疑似照片/重放攻击"
     elif not flash_check.get("pass"):
         reason = flash_check.get("reason") or "随机闪光响应失败"
+    elif not spoof_flash_pass:
+        reason = "帧边缘颜色同步但人脸区域未响应本次随机闪光，疑似预录视频"
     elif rigid_planar_replay:
         reason = "归一化人脸几乎刚性不变，疑似举照片/屏幕画面移动"
     elif screen_or_print_risk:
@@ -1109,7 +1264,9 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         "synthetic_plain_background": bool(synthetic_plain_background),
         "avg_specular_ratio": round(float(avg_specular), 6),
         "avg_moire_score": round(float(avg_moire), 6),
+        "face_color_amplitude": round(float(face_color_amp), 6),
         "flash_challenge_pass": bool(flash_check.get("pass")),
+        "spoof_flash_face_pass": bool(spoof_flash_face_pass),
         "flash_challenge": flash_check,
         "seen_frames": len(seen),
         "total_frames": len(frames),

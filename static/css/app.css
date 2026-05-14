@@ -222,24 +222,33 @@ tr:hover td { background: rgba(255,255,255,.035); }
 .camera-card { position: relative; overflow: hidden; }
 .liveness-flash {
   position: absolute;
-  inset: 18px 18px auto auto;
-  width: min(42%, 270px);
-  height: 86px;
+  inset: 0;
+  width: auto;
+  height: auto;
   z-index: 3;
   display: grid;
   place-items: center;
-  border: 2px solid rgba(255,255,255,.72);
+  border: 18px solid rgba(255,255,255,.82);
   color: #050608;
   font-weight: 950;
   letter-spacing: .12em;
   text-shadow: 0 1px 0 rgba(255,255,255,.35);
-  clip-path: polygon(14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 14px);
-  mix-blend-mode: screen;
-  opacity: .92;
+  clip-path: none;
+  mix-blend-mode: soft-light;
+  opacity: .64;
+  filter: saturate(1.45) brightness(1.12);
   pointer-events: none;
 }
+.liveness-flash::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: inherit;
+  opacity: .22;
+}
 .liveness-flash .flash-core {
-  background: rgba(255,255,255,.62);
+  position: relative;
+  background: rgba(255,255,255,.58);
   border: 1px solid rgba(0,0,0,.24);
   padding: 8px 12px;
   color: #050608;

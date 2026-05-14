@@ -123,6 +123,31 @@ def make_flash_stage_frames(face: np.ndarray, step: dict, step_ms: int = 520) ->
     return frames
 
 
+def make_weak_flash_stage_frames(face: np.ndarray, step: dict, step_ms: int = 420) -> list[dict]:
+    """模拟普通教室里屏幕打光较弱/摄像头自动白平衡压缩后的情况。"""
+    seq = step.get("flash_sequence") or [
+        {"name": "amber", "rgb": [255, 186, 36]},
+        {"name": "cyan", "rgb": [0, 210, 255]},
+        {"name": "red", "rgb": [255, 78, 78]},
+        {"name": "green", "rgb": [46, 229, 157]},
+    ]
+    frames = []
+    for idx in range(10):
+        item = seq[idx % len(seq)]
+        rgb = item.get("rgb", item)
+        tint_bgr = np.array([rgb[2], rgb[1], rgb[0]], dtype=np.float32)
+        lit = np.clip(face.astype(np.float32) * 0.88 + tint_bgr * 0.12, 0, 255).astype(np.uint8)
+        frames.append({
+            "stage": step["stage"],
+            "action": "flash_response",
+            "stage_elapsed_ms": idx * step_ms,
+            "flash_index": idx % len(seq),
+            "flash_rgb": rgb,
+            "image": encode_jpeg(make_canvas(lit)),
+        })
+    return frames
+
+
 def main() -> None:
     face = load_seed_face()
     actions = ["move_left", "blink", "open_mouth"]
@@ -131,6 +156,23 @@ def main() -> None:
         frames.extend(make_stage_frames(face, stage, action))
     live = analyze_liveness(frames, actions)
     assert live["pass"], live
+
+    weak_flash_step = {
+        "stage": 1,
+        "action": "flash_response",
+        "flash_sequence": [
+            {"name": "amber", "rgb": [255, 186, 36]},
+            {"name": "cyan", "rgb": [0, 210, 255]},
+            {"name": "red", "rgb": [255, 78, 78]},
+            {"name": "green", "rgb": [46, 229, 157]},
+        ],
+    }
+    weak_flash_live = analyze_liveness(
+        make_weak_flash_stage_frames(face, weak_flash_step),
+        ["flash_response"],
+        challenge_steps=[weak_flash_step],
+    )
+    assert weak_flash_live["pass"], weak_flash_live
 
     static_img = encode_jpeg(make_canvas(face))
     static_frames = [
@@ -152,6 +194,7 @@ def main() -> None:
     login = client.post("/api/login", json={"username": "teacher", "password": "teacher123"})
     assert login.status_code == 200, login.get_data(as_text=True)
     challenge = client.get("/api/attendance/challenge").get_json()["challenge"]
+    assert any(step["action"] == "flash_response" for step in challenge["steps"]), challenge
     endpoint_results = []
     for step in challenge["steps"]:
         if step["action"] == "flash_response":
@@ -174,6 +217,8 @@ def main() -> None:
         "normal_pass": live["pass"],
         "static_attack_pass": static_live["pass"],
         "slow_attack_pass": slow_live["pass"],
+        "weak_flash_pass": weak_flash_live["pass"],
+        "weak_flash": weak_flash_live.get("flash_challenge"),
         "stage_endpoint_results": endpoint_results,
     })
 

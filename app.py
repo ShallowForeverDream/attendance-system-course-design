@@ -37,6 +37,7 @@ from core.vision import (
 LIVENESS_GROUP_COUNT = 3
 LIVENESS_GROUP_TIMEOUT_SECONDS = 5
 LIVENESS_CHALLENGE_TTL_SECONDS = 90
+LIVENESS_FLASH_INTERVAL_MS = 700
 LIVENESS_ACTION_LABELS = {
     "move_left": "向屏幕左侧移动脸部",
     "move_right": "向屏幕右侧移动脸部",
@@ -433,6 +434,10 @@ def create_app() -> Flask:
     @require_login
     def attendance_challenge():
         actions = random.sample(LIVENESS_ACTION_POOL, LIVENESS_GROUP_COUNT)
+        # 保证正式活体每次至少包含一组随机打光挑战，方便现场稳定展示抗预录视频能力；
+        # 其它两组仍从动作池中随机抽取，满足“三组随机单动作”要求。
+        if "flash_response" not in actions:
+            actions[random.randrange(LIVENESS_GROUP_COUNT)] = "flash_response"
         flash_sequences = [_random_flash_sequence() for _ in range(LIVENESS_GROUP_COUNT)]
         now = time.time()
         challenge = {
@@ -454,7 +459,7 @@ def create_app() -> Flask:
                 "timeout_seconds": LIVENESS_GROUP_TIMEOUT_SECONDS,
                 "hint": f"第 {i}/{LIVENESS_GROUP_COUNT} 组：每组只做当前这一个动作，并在 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒内完成；检测通过后自动进入下一组；画面边缘会闪烁随机颜色用于抵御预录视频。",
                 "flash_sequence": challenge["flash_sequences"][i - 1],
-                "flash_interval_ms": 520,
+                "flash_interval_ms": LIVENESS_FLASH_INTERVAL_MS,
             }
             for i, action in enumerate(actions, start=1)
         ]
@@ -949,6 +954,7 @@ def create_app() -> Flask:
             "challenges": challenges,
             "flash_sequence_length": LIVENESS_FLASH_SEQUENCE_LENGTH,
             "flash_colors": LIVENESS_FLASH_COLORS,
+            "flash_interval_ms": LIVENESS_FLASH_INTERVAL_MS,
             "explain": f"正式考勤每次从 {len(LIVENESS_ACTION_POOL)} 个动作中随机抽取 {LIVENESS_GROUP_COUNT} 组，"
                        f"每组最多 {LIVENESS_GROUP_TIMEOUT_SECONDS} 秒，检测到当前动作才进入下一组；"
                        f"每组同步下发 {LIVENESS_FLASH_SEQUENCE_LENGTH} 段随机屏幕闪光颜色，后端校验人脸区域颜色响应。"
