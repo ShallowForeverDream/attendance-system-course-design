@@ -203,16 +203,16 @@ def create_app() -> Flask:
         if not student_no or not name:
             return jsonify({"ok": False, "error": "学号和姓名不能为空"}), 400
         ts = now_iso()
+        warning = ""
         with db() as conn:
-            try:
-                cur = conn.execute(
-                    """INSERT INTO students(student_no,name,class_name,gender,phone,email,status,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (student_no, name, payload.get("class_name", ""), payload.get("gender", ""),
-                     payload.get("phone", ""), payload.get("email", ""), payload.get("status", "active"), ts, ts),
-                )
-            except Exception as exc:
-                return jsonify({"ok": False, "error": f"新增失败：{exc}"}), 400
+            if conn.execute("SELECT id FROM students WHERE student_no=?", (student_no,)).fetchone():
+                return jsonify({"ok": False, "error": f"学号 {student_no} 已存在"}), 409
+            cur = conn.execute(
+                """INSERT INTO students(student_no,name,class_name,gender,phone,email,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (student_no, name, payload.get("class_name", ""), payload.get("gender", ""),
+                 payload.get("phone", ""), payload.get("email", ""), payload.get("status", "active"), ts, ts),
+            )
             if payload.get("create_account", True):
                 username = payload.get("username") or student_no
                 password = payload.get("password") or "student123"
@@ -222,9 +222,9 @@ def create_app() -> Flask:
                         (username, generate_password_hash(password), "student", cur.lastrowid, ts),
                     )
                 except Exception:
-                    pass
+                    warning = f"学生已创建，但账号 {username} 创建失败（用户名可能已存在）"
             log_action(conn, session.get("user_id"), "student_add", {"student_no": student_no, "name": name})
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "warning": warning})
 
     @app.post("/api/students/bulk")
     @require_role("teacher")
@@ -235,6 +235,7 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "students 不能为空"}), 400
         ts = now_iso()
         added, updated, errors = 0, 0, []
+        seen_nos = set()
         with db() as conn:
             for idx, row in enumerate(rows, start=1):
                 try:
@@ -242,6 +243,9 @@ def create_app() -> Flask:
                     name = str(row.get("name") or "").strip()
                     if not student_no or not name:
                         raise ValueError("学号和姓名不能为空")
+                    if student_no in seen_nos:
+                        raise ValueError(f"本批第 {idx} 条学号 {student_no} 与前面的条目重复")
+                    seen_nos.add(student_no)
                     old = conn.execute("SELECT id FROM students WHERE student_no=?", (student_no,)).fetchone()
                     if old:
                         conn.execute(
@@ -263,7 +267,7 @@ def create_app() -> Flask:
                                 (username, generate_password_hash(password), "student", cur.lastrowid, ts),
                             )
                         except Exception:
-                            pass
+                            errors.append({"row": idx, "student_no": student_no, "error": f"账号 {username} 创建失败（用户名可能已存在）"})
                         added += 1
                 except Exception as exc:
                     errors.append({"row": idx, "error": str(exc), "data": row})
@@ -274,14 +278,24 @@ def create_app() -> Flask:
     @require_role("teacher")
     def update_student(student_id: int):
         payload = request.get_json(force=True)
-        fields = ["student_no", "name", "class_name", "gender", "phone", "email", "status"]
-        values = {k: (payload.get(k) or "").strip() for k in fields if k in payload}
+        allowed = ["student_no", "name", "class_name", "gender", "phone", "email", "status"]
+        values = {k: (payload.get(k) or "").strip() for k in allowed if k in payload}
         if not values:
             return jsonify({"ok": False, "error": "无更新字段"}), 400
-        values["updated_at"] = now_iso()
-        sets = ",".join([f"{k}=?" for k in values])
+        ts = now_iso()
+        sets = ", ".join([f"{k}=?" for k in values])
+        params = list(values.values())
+        sets += ", updated_at=?"
+        params.append(ts)
         with db() as conn:
-            conn.execute(f"UPDATE students SET {sets} WHERE id=?", [*values.values(), student_id])
+            student = conn.execute("SELECT id FROM students WHERE id=?", (student_id,)).fetchone()
+            if not student:
+                return jsonify({"ok": False, "error": "学生不存在"}), 404
+            if "student_no" in values:
+                dup = conn.execute("SELECT id FROM students WHERE student_no=? AND id!=?", (values["student_no"], student_id)).fetchone()
+                if dup:
+                    return jsonify({"ok": False, "error": "学号已被占用"}), 409
+            conn.execute(f"UPDATE students SET {sets} WHERE id=?", params + [student_id])
             log_action(conn, session.get("user_id"), "student_update", {"student_id": student_id})
         return jsonify({"ok": True})
 
@@ -289,6 +303,9 @@ def create_app() -> Flask:
     @require_role("teacher")
     def delete_student(student_id: int):
         with db() as conn:
+            student = conn.execute("SELECT id FROM students WHERE id=?", (student_id,)).fetchone()
+            if not student:
+                return jsonify({"ok": False, "error": "学生不存在"}), 404
             conn.execute("DELETE FROM students WHERE id=?", (student_id,))
             log_action(conn, session.get("user_id"), "student_delete", {"student_id": student_id})
         return jsonify({"ok": True})
@@ -347,6 +364,8 @@ def create_app() -> Flask:
             student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
             if not student:
                 return jsonify({"ok": False, "error": "学生不存在"}), 404
+            if str(student.get("status", "active")).lower() != "active":
+                return jsonify({"ok": False, "error": "不能为非活跃状态学生添加人脸样本"}), 400
             path = save_image(face_crop, FACES_DIR / str(student_id), prefix=student["student_no"])
             conn.execute(
                 "INSERT INTO face_samples(student_id,image_path,embedding,quality,created_at) VALUES(?,?,?,?,?)",
@@ -366,6 +385,8 @@ def create_app() -> Flask:
             student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
             if not student:
                 return jsonify({"ok": False, "error": "学生不存在"}), 404
+            if str(student.get("status", "active")).lower() != "active":
+                return jsonify({"ok": False, "error": "不能为非活跃状态学生上传人脸样本"}), 400
             for fs in files:
                 suffix = Path(fs.filename or "").suffix.lower()
                 if suffix and suffix not in ALLOWED_IMAGE_EXTENSIONS:
