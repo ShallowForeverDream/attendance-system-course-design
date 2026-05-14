@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.metadata
 import json
 import math
 import os
@@ -16,26 +17,65 @@ from PIL import Image, ImageOps
 
 from .config import ANNOTATED_DIR, FACE_MATCH_THRESHOLD
 
+EMOTION_MODEL_NAME = "enet_b0_8_best_vgaf"
+EMOTION_MODEL_ENGINE = "onnx"
+EMOTION_LABEL_MAP = {
+    "Anger": "angry",
+    "Happiness": "happy",
+    "Neutral": "neutral",
+    "Sadness": "sad",
+    "Surprise": "surprise",
+    "Fear": "fear",
+    "Disgust": "disgust",
+    "Contempt": "contempt",
+}
+EMOTION_MODEL_ERROR = ""
+
 try:
     from emotiefflib.facial_analysis import EmotiEffLibRecognizer  # type: ignore
-except Exception:  # pragma: no cover - optional heavy dependency
+except Exception as exc:  # pragma: no cover - optional heavy dependency
     EmotiEffLibRecognizer = None  # type: ignore
+    EMOTION_MODEL_ERROR = f"emotiefflib import failed: {type(exc).__name__}: {exc}"
 
 _emotion_recognizer = None
 
 
 def _get_emotion_recognizer():
     """延迟加载队友新增的 EmotiEffLib 模型；未安装时不影响系统其它功能。"""
-    global _emotion_recognizer
+    global _emotion_recognizer, EMOTION_MODEL_ERROR
     if EmotiEffLibRecognizer is None:
         return None
     if _emotion_recognizer is None:
-        _emotion_recognizer = EmotiEffLibRecognizer(
-            model_name="enet_b0_8_best_vgaf",
-            engine="onnx",
-            device="cpu",
-        )
+        try:
+            _emotion_recognizer = EmotiEffLibRecognizer(
+                model_name=EMOTION_MODEL_NAME,
+                engine=EMOTION_MODEL_ENGINE,
+                device="cpu",
+            )
+            EMOTION_MODEL_ERROR = ""
+        except Exception as exc:  # pragma: no cover - depends on optional model files
+            EMOTION_MODEL_ERROR = f"{type(exc).__name__}: {exc}"
+            return None
     return _emotion_recognizer
+
+
+def emotion_diagnostics() -> dict:
+    """返回情绪模型实际加载状态，供现场验收和排查“是否用了最新模型”。"""
+    try:
+        version = importlib.metadata.version("emotiefflib")
+    except Exception:
+        version = ""
+    recognizer = _get_emotion_recognizer()
+    return {
+        "preferred_engine": "emotiefflib",
+        "active_engine": "emotiefflib" if recognizer is not None else "deepface/heuristic fallback",
+        "emotiefflib_available": EmotiEffLibRecognizer is not None,
+        "emotiefflib_loaded": recognizer is not None,
+        "emotiefflib_version": version,
+        "model_name": EMOTION_MODEL_NAME,
+        "model_engine": EMOTION_MODEL_ENGINE,
+        "model_error": EMOTION_MODEL_ERROR,
+    }
 
 
 @dataclass
@@ -587,18 +627,29 @@ def _emotiefflib_emotion(face_img: np.ndarray) -> dict | None:
         recognizer = _get_emotion_recognizer()
         if recognizer is None:
             return None
-        emotion_labels, all_scores = recognizer.predict_emotions(face_img, logits=False)
+        # OpenCV 读入为 BGR，而 EmotiEffLib/PIL 训练链路按 RGB 归一化；不转换会显著增加
+        # Surprise/Fear 等异常输出。这里保持 DeepFace 走 BGR，EmotiEffLib 单独转 RGB。
+        rgb_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB) if face_img.ndim == 3 else face_img
+        emotion_labels, all_scores = recognizer.predict_emotions(rgb_face, logits=False)
         if not emotion_labels or all_scores is None or len(all_scores) == 0:
             return None
-        label = str(emotion_labels[0])
+        raw_label = str(emotion_labels[0])
+        label = EMOTION_LABEL_MAP.get(raw_label, raw_label.lower())
         raw = np.asarray(all_scores[0], dtype=float).ravel()
         idx_to_class = getattr(recognizer, "idx_to_emotion_class", {}) or {}
         scores = {
-            str(idx_to_class.get(i, i)): round(float(raw[i]), 4)
+            EMOTION_LABEL_MAP.get(str(idx_to_class.get(i, i)), str(idx_to_class.get(i, i)).lower()): round(float(raw[i]), 4)
             for i in range(len(raw))
         }
         conf = round(float(scores.get(label, float(raw.max()) if raw.size else 0.0)), 4)
-        return {"emotion": label, "confidence": conf, "scores": scores, "engine": "emotiefflib"}
+        return {
+            "emotion": label,
+            "confidence": conf,
+            "scores": scores,
+            "engine": "emotiefflib",
+            "model": f"{EMOTION_MODEL_NAME}/{EMOTION_MODEL_ENGINE}",
+            "raw_emotion": raw_label,
+        }
     except Exception:
         return None
 
@@ -1402,6 +1453,18 @@ def _stabilize_emotion(model_result: dict, heuristic: dict) -> dict:
     weak_geometry_surprise = label == "surprise" and conf < 0.78 and (mouth_open < 0.50 or vertical_span < 0.46)
     if low_conf_surprise or weak_geometry_surprise:
         second_label, second_score = _second_best_emotion(scores, {"surprise"})
+        # 最新 EmotiEffLib 在普通证件照/课堂摄像头中有时会把“中性 + 弱阴影”低置信
+        # 判成 surprise。若 neutral 本身就是第二候选且与 surprise 差距很小，现场统计
+        # 更适合稳定为 neutral，避免“所有情绪都是 surprise”的展示问题。
+        neutral_score = float(scores.get("neutral", scores.get("Neutral", 0.0)) or 0.0)
+        if neutral_score >= 0.10 and conf - neutral_score <= 0.18 and mouth_open < 0.58:
+            guarded = dict(model_result)
+            guarded["emotion"] = "neutral"
+            guarded["confidence"] = round(float(max(neutral_score, 0.42)), 4)
+            guarded["engine"] = f"{model_result.get('engine', 'model')}+neutral_guard"
+            guarded["model_emotion"] = label
+            guarded["model_confidence"] = round(conf, 4)
+            return guarded
         if h_label != "surprise" and h_conf >= 0.45:
             guarded = dict(heuristic)
             guarded["engine"] = f"{model_result.get('engine', 'model')}+heuristic_guard"

@@ -26,6 +26,7 @@ from core.vision import (
     detect_demo_collage_layout_students,
     detect_demo_label_student_no,
     embedding_from_image,
+    emotion_diagnostics,
     face_embedding,
     image_from_base64,
     image_from_upload,
@@ -130,6 +131,12 @@ def create_app() -> Flask:
     def me():
         return jsonify({"ok": True, "user": current_user()})
 
+    @app.get("/api/emotion/diagnostics")
+    @require_login
+    def emotion_model_diagnostics():
+        """现场排查用：确认情绪分析实际使用的模型和 fallback 状态。"""
+        return jsonify({"ok": True, "diagnostics": emotion_diagnostics()})
+
     @app.get("/api/summary")
     @require_login
     def summary():
@@ -168,6 +175,7 @@ def create_app() -> Flask:
                 "emotions": conn.execute("SELECT COUNT(*) c FROM emotion_records").fetchone()["c"],
             }
             metrics = conn.execute("SELECT * FROM demo_metrics ORDER BY metric_key").fetchall()
+        emotion_diag = emotion_diagnostics()
         items = [
             {"module": "架构要求", "point": "BS 分层架构清晰", "score": 3, "route": "README + app.py/core/static/templates", "evidence": "前端、后端、数据库、算法层目录清晰"},
             {"module": "架构要求", "point": "前端适配主流浏览器，界面友好", "score": 3, "route": "总览/考勤/记录/统计页面", "evidence": "响应式 CSS、Chrome/Edge 可运行"},
@@ -191,7 +199,7 @@ def create_app() -> Flask:
             {"module": "报告源码", "point": "报告完整规范", "score": 20, "route": "docs/课程设计报告.docx + docs/课程设计报告.md", "evidence": "需求、系统设计、接口、算法、测试、结果、改进完整覆盖"},
             {"module": "报告源码", "point": "源码完整可部署", "score": 10, "route": "README.md", "evidence": "运行环境、部署步骤、依赖说明"},
         ]
-        return jsonify({"ok": True, "user": user, "counts": counts, "metrics": metrics, "items": items})
+        return jsonify({"ok": True, "user": user, "counts": counts, "metrics": metrics, "items": items, "emotion_diagnostics": emotion_diag})
 
     @app.get("/api/students")
     @require_login
@@ -1042,6 +1050,8 @@ def create_app() -> Flask:
                     "candidates": candidates,
                     "emotion": emotion["emotion"],
                     "emotion_confidence": emotion["confidence"],
+                    "emotion_engine": emotion.get("engine", ""),
+                    "emotion_model": emotion.get("model", ""),
                 })
             annotated_path = annotate_group_image(img, results)
             cur = conn.execute(

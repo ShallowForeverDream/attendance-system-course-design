@@ -22,6 +22,13 @@ function show(el, visible) { el.classList.toggle('hidden', !visible); }
 function fmt(n) { return Number(n || 0).toFixed(3); }
 function escapeHtml(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function groupStudentLabel(r) { return `${r.student_no || ''} ${r.name || ''}`.trim(); }
+function emotionText(emotion) {
+  if (!emotion) return 'unknown（0.000，engine=unknown）';
+  const engine = emotion.engine || 'unknown';
+  const model = emotion.model ? `，model=${emotion.model}` : '';
+  const guarded = emotion.model_emotion ? `，原始=${emotion.model_emotion}/${fmt(emotion.model_confidence)}` : '';
+  return `${emotion.emotion || 'unknown'}（${fmt(emotion.confidence)}，engine=${engine}${model}${guarded}）`;
+}
 
 async function refreshMe() {
   const data = await api('/api/me');
@@ -165,7 +172,7 @@ $('#manualCaptureBtn')?.addEventListener('click', async () => {
       `最佳匹配：${p.matched ? `${p.student_no} ${p.name}` : '未达到正式阈值'}\n` +
       `学生聚合分：${fmt(p.score)}（阈值 ${fmt(p.threshold)}），最佳单样本：${fmt(p.best_sample_score)}，该生样本数：${p.sample_count || 0}\n` +
       `第二名：${fmt(p.second_score)}，间隔：${fmt(p.score_margin)}\n` +
-      `情绪：${p.emotion.emotion}（${fmt(p.emotion.confidence)}）\n` +
+      `情绪：${emotionText(p.emotion)}\n` +
       `说明：${p.note}`;
   } catch (err) {
     $('#attendanceMsg').className = 'result-box bad';
@@ -279,7 +286,7 @@ $('#startCheckBtn').addEventListener('click', async () => {
       `姓名：${r.name || '-'}\n学号：${r.student_no || '-'}\n时间：${r.time}\n` +
       `活体：${r.liveness.pass ? '通过' : '未通过'}（${r.liveness.reason}，分数 ${fmt(r.liveness.score)}）\n` +
       `人脸匹配分：${fmt(r.face_score)}（阈值 ${fmt(r.face_threshold)}，最佳单样本 ${fmt(r.best_sample_score)}，样本数 ${r.sample_count || 0}）\n` +
-      `情绪：${r.emotion.emotion}（${fmt(r.emotion.confidence)}）\n备注：${r.note || '-'}`;
+      `情绪：${emotionText(r.emotion)}\n备注：${r.note || '-'}`;
     await Promise.allSettled([loadSummary(), loadRecords(), loadStats()]);
   } catch (err) {
     hideFlashColor();
@@ -426,8 +433,8 @@ $('#groupForm').addEventListener('submit', async (e) => {
       `<div id="groupChecklist" class="check-grid"></div>` +
       `<div class="toolbar"><select id="manualStudentSelect"></select><button id="manualAddBtn" type="button">补选学生</button><button id="confirmGroupBtn" type="button">确认并写入活动频次</button></div>` +
       `<div id="confirmGroupMsg" class="small"></div></div>` +
-      `<div class="table-wrap"><table><thead><tr><th>序号</th><th>自动结果</th><th>最佳候选</th><th>状态</th><th>聚合分</th><th>单样本/样本数</th><th>间隔</th><th>情绪</th></tr></thead><tbody>` +
-      data.results.map(r => `<tr><td>${r.face_index}</td><td>${escapeHtml(r.matched ? groupStudentLabel(r) : '未自动确认')}</td><td>${escapeHtml(r.candidate_student_no ? `${r.candidate_student_no} ${r.candidate_name}` : '-')}</td><td>${r.matched ? '<span class="badge ok">自动确认</span>' : (r.needs_review ? '<span class="badge warn">待确认</span>' : '<span class="badge bad">未匹配</span>')}</td><td>${fmt(r.score)}</td><td>${fmt(r.best_sample_score)} / ${r.sample_count || 0}</td><td>${fmt(r.score_margin)}</td><td>${escapeHtml(r.emotion)}</td></tr>`).join('') +
+      `<div class="table-wrap"><table><thead><tr><th>序号</th><th>自动结果</th><th>最佳候选</th><th>状态</th><th>聚合分</th><th>单样本/样本数</th><th>间隔</th><th>情绪</th><th>情绪引擎</th></tr></thead><tbody>` +
+      data.results.map(r => `<tr><td>${r.face_index}</td><td>${escapeHtml(r.matched ? groupStudentLabel(r) : '未自动确认')}</td><td>${escapeHtml(r.candidate_student_no ? `${r.candidate_student_no} ${r.candidate_name}` : '-')}</td><td>${r.matched ? '<span class="badge ok">自动确认</span>' : (r.needs_review ? '<span class="badge warn">待确认</span>' : '<span class="badge bad">未匹配</span>')}</td><td>${fmt(r.score)}</td><td>${fmt(r.best_sample_score)} / ${r.sample_count || 0}</td><td>${fmt(r.score_margin)}</td><td>${escapeHtml(r.emotion)}（${fmt(r.emotion_confidence)}）</td><td>${escapeHtml(r.emotion_engine || 'unknown')}</td></tr>`).join('') +
       `</tbody></table></div>`;
     const checklist = $('#groupChecklist');
     const addCheck = (id, label, checked, source) => {
@@ -583,6 +590,15 @@ async function loadScorecard() {
   const labels = {students: '学生', face_samples: '样本', attendance: '考勤', attendance_success: '成功考勤', activities: '活动', participants: '参与记录', emotions: '情绪记录'};
   $('#scorecardSummary').innerHTML = Object.entries(data.counts)
     .map(([k,v]) => `<div class="card"><div class="num">${v}</div><div class="label">${labels[k] || k}</div></div>`).join('');
+  const diag = data.emotion_diagnostics || {};
+  $('#emotionDiagnostics').innerHTML =
+    `<div class="notice"><strong>情绪模型诊断：</strong>` +
+    `active=${escapeHtml(diag.active_engine || 'unknown')}；` +
+    `emotiefflib=${diag.emotiefflib_loaded ? '已加载' : '未加载'}；` +
+    `version=${escapeHtml(diag.emotiefflib_version || '-')}；` +
+    `model=${escapeHtml(diag.model_name || '-')}/${escapeHtml(diag.model_engine || '-')}` +
+    `${diag.model_error ? `；error=${escapeHtml(diag.model_error)}` : ''}` +
+    `</div>`;
   $('#scorecardTable').innerHTML =
     `<thead><tr><th>模块</th><th>得分点</th><th>分值</th><th>现场打开</th><th>证据</th><th>状态</th></tr></thead><tbody>` +
     data.items.map(item => {

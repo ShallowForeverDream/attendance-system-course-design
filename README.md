@@ -7,10 +7,10 @@
 - 前端：HTML + CSS + JavaScript，浏览器 `getUserMedia` 调用摄像头；界面采用战术工业终端风格和分段任务式交互
 - 后端：Flask API
 - 数据库：SQLite
-- 视觉算法：OpenCV Haar 人脸检测 + 本地 LBP/纹理特征向量匹配 + 动作活体检测 + 轻量情绪启发式分类
+- 视觉算法：OpenCV Haar 人脸检测 + 本地 LBP/纹理特征向量匹配 + 动作活体检测 + EmotiEffLib EfficientNet-B0 ONNX 情绪识别（未安装时自动回退 DeepFace/启发式）
 - 导出：openpyxl 生成 Excel
 
-> 当前实现优先保证课程验收端到端可运行；若后续允许安装 DeepFace/FER/InsightFace，可在 `core/vision.py` 中替换 `face_embedding()` 与 `analyze_emotion()`，不影响 API 与前端。
+> 情绪识别默认优先加载 `emotiefflib>=1.1.1` 的 `enet_b0_8_best_vgaf` ONNX 模型；前端“考勤结果/手动预检/验收清单”会显示实际 `engine`，现场可直接证明是否加载了最新模型。首次运行会把模型缓存到用户目录 `.emotiefflib`。
 
 ## 2. 快速运行
 
