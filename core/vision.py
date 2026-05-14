@@ -11,9 +11,23 @@ from typing import Iterable
 
 import cv2
 import numpy as np
+from emotiefflib.facial_analysis import EmotiEffLibRecognizer
 from PIL import Image, ImageOps
 
 from .config import ANNOTATED_DIR, FACE_MATCH_THRESHOLD
+
+_emotion_recognizer = None
+
+
+def _get_emotion_recognizer() -> EmotiEffLibRecognizer:
+    global _emotion_recognizer
+    if _emotion_recognizer is None:
+        _emotion_recognizer = EmotiEffLibRecognizer(
+            model_name='enet_b0_8_best_vgaf',
+            engine='onnx',
+            device='cpu',
+        )
+    return _emotion_recognizer
 
 
 @dataclass
@@ -677,32 +691,17 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None) -> di
 def analyze_emotion(face_img: np.ndarray) -> dict:
     if face_img is None or face_img.size == 0:
         return {"emotion": "unknown", "confidence": 0.0}
-    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
-    gray = cv2.equalizeHist(gray)
-    upper = gray[:42, :]
-    middle = gray[32:68, :]
-    lower = gray[56:, :]
-    brightness = gray.mean() / 255.0
-    contrast = gray.std() / 80.0
-    mouth_dark = float((lower < np.percentile(gray, 28)).mean())
-    eye_dark = float((upper < np.percentile(gray, 24)).mean())
-    lower_edge = cv2.Canny(lower, 80, 160).mean() / 255.0
-    mid_sym = 1.0 - np.mean(np.abs(middle[:, :48].astype(float) - np.fliplr(middle[:, 48:]).astype(float))) / 255.0
-    scores = {
-        "happy": 0.26 + 0.42 * mouth_dark + 0.18 * lower_edge + 0.10 * brightness + 0.08 * mid_sym,
-        "surprise": 0.18 + 0.58 * mouth_dark + 0.18 * eye_dark + 0.12 * lower_edge,
-        "sad": 0.24 + 0.28 * (1 - brightness) + 0.22 * eye_dark + 0.10 * (1 - mid_sym),
-        "angry": 0.20 + 0.30 * min(contrast, 1) + 0.28 * eye_dark + 0.12 * (1 - mid_sym),
-        "neutral": 0.48 + 0.16 * mid_sym + 0.10 * (1 - abs(brightness - 0.5)),
-    }
-    if max(scores.values()) - scores["neutral"] < 0.12:
-        label = "neutral"
-    else:
-        label = max(scores, key=scores.get)
-    total = sum(max(v, 0) for v in scores.values()) + 1e-6
-    conf = max(0.35, min(scores[label] / total * 2.0, 0.96))
-    return {"emotion": label, "confidence": round(float(conf), 4), "scores": {k: round(float(v), 4) for k, v in scores.items()}}
+    try:
+        fer = _get_emotion_recognizer()
+        emotion_labels, all_scores = fer.predict_emotions(face_img, logits=False)
+        label = emotion_labels[0]
+        raw = all_scores[0]
+        idx_to_class = fer.idx_to_emotion_class
+        scores = {idx_to_class[i]: round(float(raw[i]), 4) for i in range(len(raw))}
+        conf = round(float(scores.get(label, 0)), 4)
+        return {"emotion": label, "confidence": conf, "scores": scores}
+    except Exception:
+        return {"emotion": "unknown", "confidence": 0.0}
 
 
 def annotate_group_image(img: np.ndarray, results: list[dict]) -> Path:
