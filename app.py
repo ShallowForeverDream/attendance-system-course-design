@@ -15,6 +15,7 @@ from werkzeug.security import generate_password_hash
 
 from core.config import ALLOWED_IMAGE_EXTENSIONS, BASE_DIR, FACES_DIR, SECRET_KEY, UPLOAD_DIR, UPLOAD_MAX_MB
 from core.db import db, init_db, log_action, now_iso, upsert_metric
+from core.face_import import is_supported_face_image, parse_student_image_filename
 from core.security import current_user, require_login, require_role, verify_user
 from core.vision import (
     analyze_emotion,
@@ -63,6 +64,22 @@ LIVENESS_FLASH_COLORS = [
 ]
 
 
+def storage_url(path: str | Path) -> str:
+    """把数据库中的 storage 相对路径统一转换成浏览器可访问 URL。"""
+    rel = str(path or "").replace("\\", "/").lstrip("/")
+    if rel.startswith("storage/"):
+        rel = rel[len("storage/"):]
+    return "/storage/" + rel
+
+
+def safe_image_prefix(text: str, fallback: str = "img") -> str:
+    """生成适合 Windows/URL 的保存前缀，避免中文/特殊符号导致预览路径兼容问题。"""
+    import re
+
+    cleaned = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(text or "")).strip("._-")
+    return (cleaned or fallback)[:80]
+
+
 def _random_flash_sequence() -> list[dict]:
     # 每组生成独立随机颜色序列；允许颜色重复，但避免相邻两帧完全相同。
     seq = []
@@ -102,7 +119,8 @@ def create_app() -> Flask:
                 ).fetchone()
             if not own_face:
                 return jsonify({"ok": False, "error": "权限不足"}), 403
-        return send_from_directory(root, filename)
+        rel_name = str(target.relative_to(root)).replace("\\", "/")
+        return send_from_directory(root, rel_name)
 
     @app.post("/api/login")
     def login():
@@ -357,8 +375,9 @@ def create_app() -> Flask:
             ).fetchall()
         faces = []
         for r in rows:
-            url = "/storage/" + str(r["image_path"]).replace("storage/", "", 1).replace(os.sep, "/")
-            faces.append({**r, "url": url})
+            image_path = str(r["image_path"] or "")
+            exists = (BASE_DIR / image_path).exists()
+            faces.append({**r, "url": storage_url(image_path), "exists": exists})
         return jsonify({"ok": True, "student": student, "faces": faces})
 
     @app.delete("/api/faces/<int:face_id>")
@@ -397,7 +416,7 @@ def create_app() -> Flask:
                 return jsonify({"ok": False, "error": "学生不存在"}), 404
             if str(student.get("status", "active")).lower() != "active":
                 return jsonify({"ok": False, "error": "不能为非活跃状态学生添加人脸样本"}), 400
-            path = save_image(face_crop, FACES_DIR / str(student_id), prefix=student["student_no"])
+            path = save_image(face_crop, FACES_DIR / str(student_id), prefix=safe_image_prefix(student["student_no"], "student"))
             conn.execute(
                 "INSERT INTO face_samples(student_id,image_path,embedding,quality,created_at) VALUES(?,?,?,?,?)",
                 (student_id, str(path.relative_to(BASE_DIR)), json.dumps(emb), q, now_iso()),
@@ -427,7 +446,7 @@ def create_app() -> Flask:
                     img = image_from_upload(fs)
                     emb, box, q = embedding_from_image(img)
                     face_crop = crop_face(img, box)
-                    path = save_image(face_crop, FACES_DIR / str(student_id), prefix=student["student_no"])
+                    path = save_image(face_crop, FACES_DIR / str(student_id), prefix=safe_image_prefix(student["student_no"], "student"))
                     conn.execute(
                         "INSERT INTO face_samples(student_id,image_path,embedding,quality,created_at) VALUES(?,?,?,?,?)",
                         (student_id, str(path.relative_to(BASE_DIR)), json.dumps(emb), q, now_iso()),
@@ -437,6 +456,80 @@ def create_app() -> Flask:
                     errors.append({"file": fs.filename, "error": str(exc)})
             log_action(conn, session.get("user_id"), "face_upload", {"student_id": student_id, "added": len(added), "errors": errors})
         return jsonify({"ok": bool(added), "added": added, "errors": errors})
+
+    @app.post("/api/students/faces/bulk")
+    @require_role("teacher")
+    def bulk_import_student_face_images():
+        """按“学号-姓名-专业-性别.jpg/png”批量导入学生和人脸样本。"""
+        files = request.files.getlist("faces")
+        if not files:
+            return jsonify({"ok": False, "error": "请选择至少一张 jpg/png 人脸图片"}), 400
+        added_samples, added_students, updated_students, errors = [], 0, 0, []
+        ts = now_iso()
+        with db() as conn:
+            for fs in files:
+                raw_name = fs.filename or ""
+                if not is_supported_face_image(raw_name):
+                    errors.append({"file": raw_name, "error": "不支持的图片格式，仅支持 jpg/png/jpeg/bmp/webp"})
+                    continue
+                meta = parse_student_image_filename(raw_name)
+                student_no = str(meta.get("student_no") or "").strip()
+                name = str(meta.get("name") or "").strip()
+                if not student_no or not name:
+                    errors.append({"file": raw_name, "error": "文件名无法解析出学号和姓名，请使用 学号-姓名-专业-性别.jpg/png"})
+                    continue
+                try:
+                    old = conn.execute("SELECT id FROM students WHERE student_no=?", (student_no,)).fetchone()
+                    if old:
+                        student_id = old["id"]
+                        conn.execute(
+                            "UPDATE students SET name=?,class_name=?,gender=?,status='active',updated_at=? WHERE id=?",
+                            (name, meta.get("class_name", ""), meta.get("gender", ""), ts, student_id),
+                        )
+                        updated_students += 1
+                    else:
+                        cur = conn.execute(
+                            """INSERT INTO students(student_no,name,class_name,gender,status,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?)""",
+                            (student_no, name, meta.get("class_name", ""), meta.get("gender", ""), "active", ts, ts),
+                        )
+                        student_id = cur.lastrowid
+                        added_students += 1
+                    img = image_from_upload(fs)
+                    emb, box, q = embedding_from_image(img)
+                    face_crop = crop_face(img, box, pad=0.22)
+                    prefix = safe_image_prefix(f"{student_no}_{Path(meta.get('filename') or raw_name).stem}", student_no)
+                    path = save_image(face_crop, FACES_DIR / str(student_id), prefix=prefix)
+                    rel = str(path.relative_to(BASE_DIR))
+                    conn.execute(
+                        "INSERT INTO face_samples(student_id,image_path,embedding,quality,created_at) VALUES(?,?,?,?,?)",
+                        (student_id, rel, json.dumps(emb), q, ts),
+                    )
+                    added_samples.append({
+                        "file": raw_name,
+                        "student_id": student_id,
+                        "student_no": student_no,
+                        "name": name,
+                        "quality": round(float(q), 3),
+                        "path": rel,
+                        "url": storage_url(rel),
+                    })
+                except Exception as exc:
+                    errors.append({"file": raw_name, "student_no": student_no, "name": name, "error": str(exc)})
+            log_action(conn, session.get("user_id"), "face_bulk_import", {
+                "samples_added": len(added_samples),
+                "students_added": added_students,
+                "students_updated": updated_students,
+                "errors": errors[:10],
+            })
+        return jsonify({
+            "ok": bool(added_samples),
+            "students_added": added_students,
+            "students_updated": updated_students,
+            "samples_added": len(added_samples),
+            "added": added_samples,
+            "errors": errors,
+        })
 
     @app.get("/api/attendance/challenge")
     @require_login
@@ -1081,7 +1174,7 @@ def create_app() -> Flask:
             "matched_count": len({r["student_id"] for r in results if r["matched"]}),
             "review_count": sum(1 for r in results if r["needs_review"]),
             "results": results,
-            "annotated_url": "/storage/" + str(annotated_path.relative_to(BASE_DIR / "storage")).replace(os.sep, "/"),
+            "annotated_url": storage_url(annotated_path.relative_to(BASE_DIR)),
         })
 
     @app.post("/api/group/<int:activity_id>/participants")

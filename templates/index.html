@@ -106,6 +106,15 @@
         <button type="submit">新增学生</button>
       </form>
       <details class="subpanel">
+        <summary>批量导入人脸图片（jpg/png，按文件名建学生）</summary>
+        <p class="small">支持直接多选老师给的图片；文件名格式：<code>2022302181209-吴悦-网络空间安全-女.jpg</code> 或 <code>.png</code>，系统会解析“学号-姓名-专业-性别”，自动创建/更新学生并加入人脸样本。</p>
+        <form id="bulkFaceImportForm" class="toolbar">
+          <input type="file" name="faces" accept=".jpg,.jpeg,.png,.bmp,.webp,image/*" multiple required />
+          <button type="submit">批量导入人脸库</button>
+        </form>
+        <div id="bulkFaceImportMsg" class="small"></div>
+      </details>
+      <details class="subpanel">
         <summary>批量导入学生（JSON）</summary>
         <p class="small">格式示例：<code>[{"student_no":"20260003","name":"王五","class_name":"内容安全实践班"}]</code></p>
         <textarea id="bulkStudentsInput" rows="5" placeholder='[{"student_no":"20260003","name":"王五","class_name":"内容安全实践班"}]'></textarea>

@@ -381,7 +381,7 @@ async function showFaceSamples(studentId) {
     panel.innerHTML =
       `<div class="section-head compact"><div><h3>人脸样本：${escapeHtml(title)}</h3><p>可单独删除质量差、重复或误导入的人脸样本，满足人脸库“单个添加/删除/修改维护”的现场展示。</p></div><button id="closeFacesPanel" class="ghost" type="button">关闭</button></div>` +
       (data.faces.length ? `<div class="face-sample-grid">` + data.faces.map(f =>
-        `<div class="face-sample-card" data-face-id="${f.id}"><img src="${f.url}" alt="face sample ${f.id}" /><div class="small">ID ${f.id} · 质量 ${fmt(f.quality)}<br>${escapeHtml(f.created_at)}</div><button class="ghost delete-face" type="button">删除该样本</button></div>`
+        `<div class="face-sample-card" data-face-id="${f.id}"><a href="${f.url}" target="_blank" title="打开原图"><img src="${f.url}" alt="face sample ${f.id}" loading="lazy" onerror="this.closest('.face-sample-card').classList.add('broken'); this.replaceWith(Object.assign(document.createElement('div'), {className:'broken-img', textContent:'图片文件不存在或路径失效'}));" /></a><div class="small">ID ${f.id} · 质量 ${fmt(f.quality)}<br>${escapeHtml(f.created_at)}${f.exists === false ? '<br><span class="bad-text">文件缺失</span>' : ''}</div><button class="ghost delete-face" type="button">删除该样本</button></div>`
       ).join('') + `</div>` : '<p class="small">该学生暂无人脸样本，可通过文件上传或摄像头补采添加。</p>');
     $('#closeFacesPanel').addEventListener('click', () => panel.classList.add('hidden'));
     $$('.delete-face', panel).forEach(btn => btn.addEventListener('click', async e => {
@@ -402,6 +402,21 @@ $('#bulkStudentsBtn')?.addEventListener('click', async () => {
     alert(`批量导入完成：新增 ${res.added}，更新 ${res.updated}，错误 ${res.errors.length}`);
     await Promise.all([loadStudents(), loadSummary(), loadScorecard()]);
   } catch (err) { alert('批量导入失败：' + err.message); }
+});
+
+$('#bulkFaceImportForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = $('#bulkFaceImportMsg');
+  msg.textContent = '正在批量导入人脸图片，请稍候...';
+  try {
+    const res = await api('/api/students/faces/bulk', {method: 'POST', body: new FormData(e.currentTarget)});
+    msg.textContent =
+      `导入完成：新增学生 ${res.students_added}，更新学生 ${res.students_updated}，新增样本 ${res.samples_added}，失败 ${res.errors.length}` +
+      (res.errors.length ? `\n失败明细：\n${res.errors.slice(0, 12).map(x => `${x.file}: ${x.error}`).join('\n')}` : '');
+    await Promise.all([loadStudents(), loadSummary(), loadScorecard()]);
+  } catch (err) {
+    msg.textContent = '批量导入失败：' + err.message;
+  }
 });
 
 $('#addFaceFromCameraBtn')?.addEventListener('click', async () => {

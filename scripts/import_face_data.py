@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -13,33 +12,8 @@ sys.path.insert(0, str(ROOT))
 
 from core.config import BASE_DIR, FACES_DIR  # noqa: E402
 from core.db import db, init_db, now_iso, upsert_metric  # noqa: E402
+from core.face_import import IMAGE_EXTS, parse_student_image_filename  # noqa: E402
 from core.vision import crop_face, embedding_from_image, read_image_path, save_image  # noqa: E402
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-
-def parse_name(path: Path) -> dict:
-    stem = path.stem.strip()
-    parts = [p.strip() for p in stem.split("-") if p.strip()]
-    if len(parts) >= 4:
-        return {
-            "student_no": parts[0],
-            "name": parts[1],
-            "class_name": parts[2],
-            "gender": parts[3],
-        }
-    # 兼容 “2023000000001张三网安男.jpg” 这类无分隔符命名。
-    m = re.match(r"^(?P<no>\d{10,13})(?P<rest>.+)$", stem)
-    if m:
-        rest = m.group("rest")
-        gender = ""
-        if rest.endswith("男") or rest.endswith("女"):
-            gender = rest[-1]
-            rest = rest[:-1]
-        class_name = "网络空间安全" if "网安" in rest or "网络" in rest else ""
-        name = rest.replace("网络空间安全", "").replace("网络安全", "").replace("网安", "").replace("试验班", "").replace("实验班", "").strip()
-        return {"student_no": m.group("no"), "name": name or stem, "class_name": class_name, "gender": gender}
-    return {"student_no": stem, "name": stem, "class_name": "", "gender": ""}
 
 
 def import_face_data(source: Path, reset_demo: bool = False, limit: int | None = None) -> dict:
@@ -73,7 +47,7 @@ def import_face_data(source: Path, reset_demo: bool = False, limit: int | None =
             ).fetchall()
         }
         for img_path in images:
-            meta = parse_name(img_path)
+            meta = parse_student_image_filename(img_path)
             student_no = meta["student_no"]
             name = meta["name"]
             try:
