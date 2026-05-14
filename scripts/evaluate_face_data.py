@@ -13,7 +13,7 @@ from core.vision import cosine_similarity  # noqa: E402
 
 
 def evaluate(thresholds: list[float] | None = None) -> dict:
-    thresholds = thresholds or [0.60, 0.70, 0.78, 0.80, 0.85, 0.90, 0.95]
+    thresholds = thresholds or [0.60, 0.70, 0.75, 0.78, 0.80, 0.85, 0.90, 0.95]
     init_db(seed=True)
     with db() as conn:
         rows = conn.execute(
@@ -70,10 +70,10 @@ def evaluate(thresholds: list[float] | None = None) -> dict:
         "thresholds": by_threshold,
         "note": "当前 face_data 每人基本只有 1 张，因此同人正样本对较少；该评估主要用于证明阈值、误识别风险和样本覆盖率。",
     }
-    # 用默认阈值附近的误接收率作为报告指标。
-    default = min(by_threshold, key=lambda x: abs(x["threshold"] - 0.78))
+    # 用默认阈值 0.70 附近的误接收率作为报告指标。
+    default = min(by_threshold, key=lambda x: abs(x["threshold"] - 0.70))
     with db() as conn:
-        upsert_metric(conn, "face_pair_false_accept_rate_at_0.78", default["false_accept_rate"], report["pairs"], default)
+        upsert_metric(conn, "face_pair_false_accept_rate_at_0.70", default["false_accept_rate"], report["pairs"], default)
         upsert_metric(conn, "face_data_students_with_samples", report["students"], report["samples"], report)
     return report
 

@@ -4,7 +4,7 @@
 
 ## 1. 技术栈
 
-- 前端：HTML + CSS + JavaScript，浏览器 `getUserMedia` 调用摄像头
+- 前端：HTML + CSS + JavaScript，浏览器 `getUserMedia` 调用摄像头；界面采用战术工业终端风格和分段任务式交互
 - 后端：Flask API
 - 数据库：SQLite
 - 视觉算法：OpenCV Haar 人脸检测 + 本地 LBP/纹理特征向量匹配 + 动作活体检测 + 轻量情绪启发式分类
@@ -58,7 +58,7 @@ python app.py
 | 摄像头采集 | `static/js/app.js` 使用 `navigator.mediaDevices.getUserMedia()` |
 | 手动/自动捕捉 | “手动抓拍预检”可做单帧质量/识别/情绪预检；“开始活体打卡”按 3 组随机动作自动采集多帧，每组最多 5 秒，检测到动作才进入下一组 |
 | 活体检测 | `analyze_liveness()`：9 种动作池 + 3 组限时挑战 + 多帧人脸质量/纹理/运动检测 |
-| 人脸库 | 学生 CRUD + 查看/删除单个人脸样本 + 多人脸样本上传 + `face_data` 批量导入 + 摄像头补采样本 |
+| 人脸库 | 学生 CRUD + 查看/删除单个人脸样本 + 多人脸样本上传 + `face_data` 批量导入 + 摄像头补采样本；同一学生多样本会按学生聚合得分 |
 | 考勤记录 | `attendance_records` 表，支持筛选与 Excel 导出 |
 | 合照识别 | 上传合照，批量检测人脸、逐个匹配人脸库、生成标注图和名单 |
 | 活动频次 | `activity_participants` 汇总统计 |
@@ -88,7 +88,7 @@ python app.py
 - `docs/face_data_evaluation_report.json`
 - `docs/demo_collage_report.json`
 
-当前默认人脸阈值为 `0.78`，兼顾合照召回率与误识别率。`scripts/make_demo_collage.py` 会生成 10 人 PNG 演示合照，`scripts/group_collage_selftest.py` 会通过系统真实 `/api/group/recognize` 接口自测，目前演示合照检测 10 张人脸、自动匹配 10 人，召回率和精确率均为 1.0。`scripts/prepare_demo.py` 还会额外生成 50 人压力合照 `demo_collage_50_pressure.png`，可用 `scripts/group_collage_50_selftest.py` 作为“可处理 10–50 人多人合照”的加分证据。合照页面还提供“自动识别 + 教师人工确认/补选”闭环，更符合真实系统。
+当前默认人脸阈值为 `0.70`，因此考勤分数达到 `0.708` 这类情况会输出并匹配最相近学生。识别逻辑按“学生”聚合多张样本：先计算该学生所有样本相似度，再综合最高分、TopK 均值和稳定样本数，所以上传 3–5 张不同光照/角度图片会比单张更稳。`scripts/make_demo_collage.py` 会生成 10 人 PNG 演示合照，`scripts/group_collage_selftest.py` 会通过系统真实 `/api/group/recognize` 接口自测，目前演示合照检测 10 张人脸、自动匹配 10 人，召回率和精确率均为 1.0。`scripts/prepare_demo.py` 还会额外生成 50 人压力合照 `demo_collage_50_pressure.png`，可用 `scripts/group_collage_50_selftest.py` 作为“可处理 10–50 人多人合照”的加分证据。合照页面还提供“自动识别 + 教师人工确认/补选”闭环，更符合真实系统。
 
 ## 6. 目录结构
 

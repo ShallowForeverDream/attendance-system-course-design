@@ -479,14 +479,21 @@ def create_app() -> Flask:
                 """SELECT f.*,s.student_no,s.name,s.class_name FROM face_samples f
                    JOIN students s ON s.id=f.student_id WHERE s.status='active'"""
             ).fetchall()
-            match = recognize(emb, samples)
+            match = recognize(emb, samples, threshold=0.70)
             student = match.get("student") if match.get("matched") else None
             status = "success" if live["pass"] and student else "failed"
             note = []
             if not live["pass"]:
                 note.append(f"活体失败：{live.get('reason')}")
             if not student:
-                note.append("人脸库未匹配")
+                if match.get("student"):
+                    st = match["student"]
+                    note.append(
+                        f"人脸库未达阈值，最接近：{st.get('student_no','')} {st.get('name','')} "
+                        f"({match.get('score', 0):.3f} < {match.get('threshold', 0.70):.2f})"
+                    )
+                else:
+                    note.append("人脸库未匹配")
             if user["role"] == "student" and student and student["student_id"] != user["student_id"]:
                 status = "failed"
                 note.append("学生账号只能为本人打卡")
@@ -514,6 +521,9 @@ def create_app() -> Flask:
                 "name": sname,
                 "liveness": live,
                 "face_score": round(match.get("score", 0), 4),
+                "face_threshold": round(match.get("threshold", 0.70), 4),
+                "best_sample_score": round(match.get("best_sample_score", 0), 4),
+                "sample_count": match.get("sample_count", 0),
                 "emotion": emotion,
                 "time": now_iso(),
                 "note": "; ".join(note),
@@ -591,7 +601,7 @@ def create_app() -> Flask:
                     """SELECT f.*,s.student_no,s.name,s.class_name FROM face_samples f
                        JOIN students s ON s.id=f.student_id WHERE s.status='active'"""
                 ).fetchall()
-            match = recognize(emb, samples)
+            match = recognize(emb, samples, threshold=0.70)
             candidates = []
             for c in match.get("candidates", []):
                 st = c.get("student") or {}
@@ -600,6 +610,8 @@ def create_app() -> Flask:
                     "name": st.get("name", ""),
                     "class_name": st.get("class_name", ""),
                     "score": round(c.get("score", 0), 4),
+                    "best_sample_score": round(c.get("best_sample_score", c.get("score", 0)), 4),
+                    "sample_count": c.get("sample_count", 1),
                 })
             log_action(conn, session.get("user_id"), "attendance_preview", {
                 "faces": len(faces),
@@ -619,6 +631,9 @@ def create_app() -> Flask:
                 "score": round(match.get("score", 0), 4),
                 "second_score": round(match.get("second_score", 0), 4),
                 "score_margin": round(match.get("margin", 0), 4),
+                "threshold": round(match.get("threshold", 0.70), 4),
+                "best_sample_score": round(match.get("best_sample_score", 0), 4),
+                "sample_count": match.get("sample_count", 0),
                 "emotion": emotion,
                 "candidates": candidates,
                 "note": "该功能只做手动抓拍预检，不写入考勤；正式考勤必须通过随机动作活体检测。",
@@ -789,7 +804,7 @@ def create_app() -> Flask:
         original_path = save_image(img, UPLOAD_DIR, prefix="group")
         faces = detect_faces(img, min_size=38)
         results = []
-        auto_threshold = float(request.form.get("threshold") or 0.78)
+        auto_threshold = float(request.form.get("threshold") or 0.70)
         review_threshold = float(request.form.get("review_threshold") or 0.70)
         with db() as conn:
             samples = conn.execute(
@@ -832,6 +847,8 @@ def create_app() -> Flask:
                         "name": st.get("name", ""),
                         "class_name": st.get("class_name", ""),
                         "score": round(c.get("score", 0), 4),
+                        "best_sample_score": round(c.get("best_sample_score", c.get("score", 0)), 4),
+                        "sample_count": c.get("sample_count", 1),
                     })
                 results.append({
                     "face_index": idx,
@@ -845,6 +862,8 @@ def create_app() -> Flask:
                     "score": round(match.get("score", 0), 4),
                     "second_score": round(match.get("second_score", 0), 4),
                     "score_margin": round(match.get("margin", 0), 4),
+                    "best_sample_score": round(match.get("best_sample_score", 0), 4),
+                    "sample_count": match.get("sample_count", 0),
                     "label_student_no": label_student_no,
                     "candidate_student_id": best["student_id"] if best else None,
                     "candidate_student_no": best["student_no"] if best else "",

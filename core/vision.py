@@ -345,24 +345,60 @@ def recognize(
     threshold: float = FACE_MATCH_THRESHOLD,
     margin: float = 0.0,
 ) -> dict:
-    """在人脸库中查找最相似样本。
+    """在人脸库中按“学生”聚合匹配。
 
-    返回 top-3 候选和 best/second/margin 信息，便于合照场景做“自动识别 + 人工确认”。
-    margin=0 时保持原来的阈值判定；margin>0 时要求第一名相对第二名有足够间隔，降低误识别。
+    一个学生上传多张图片时，不再只把每张图当作互相独立的候选；系统会先计算
+    该学生所有样本的相似度，再用“最高分 + TopK 均值 + 样本覆盖奖励”聚合为
+    学生级分数。这样多张不同光照/角度照片能提升鲁棒性，但低质量或不相似样本
+    不会简单拉高结果。
+
+    返回 top-3 学生候选和 best/second/margin 信息，便于合照场景做
+    “自动识别 + 人工确认”。margin=0 时只要求达到阈值；margin>0 时还要求第一名
+    相对第二名有足够间隔，降低误识别。
     """
-    candidates: list[dict] = []
+    sample_candidates: list[dict] = []
+    by_student: dict[int | str, dict] = {}
     for sample in samples:
         try:
             emb = json.loads(sample["embedding"])
             score = cosine_similarity(embedding, emb)
         except Exception:
             continue
-        candidates.append({"student": sample, "score": float(score), "sample_id": sample.get("id")})
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    if not candidates:
+        item = {"student": sample, "score": float(score), "sample_id": sample.get("id")}
+        sample_candidates.append(item)
+        sid = sample.get("student_id") or sample.get("id") or sample.get("student_no")
+        bucket = by_student.setdefault(sid, {"student": sample, "scores": [], "sample_ids": []})
+        bucket["scores"].append(float(score))
+        bucket["sample_ids"].append(sample.get("id"))
+
+    if not sample_candidates:
         return {"matched": False, "student": None, "score": 0.0, "sample_id": None, "second_score": 0.0, "margin": 0.0, "candidates": []}
-    best = candidates[0]
-    second_score = float(candidates[1]["score"]) if len(candidates) > 1 else 0.0
+
+    student_candidates: list[dict] = []
+    for bucket in by_student.values():
+        scores = sorted(bucket["scores"], reverse=True)
+        best_score = scores[0]
+        topk = scores[: min(3, len(scores))]
+        topk_mean = float(np.mean(topk))
+        # 多样本奖励有上限，避免堆大量低质量图片导致虚高；只有接近最佳分的样本才贡献稳定性。
+        support = sum(1 for s in scores if s >= best_score - 0.06)
+        support_bonus = min(0.035, max(0, support - 1) * 0.012)
+        aggregate_score = min(1.0, 0.82 * best_score + 0.18 * topk_mean + support_bonus)
+        best_index = bucket["scores"].index(best_score)
+        student_candidates.append({
+            "student": bucket["student"],
+            "score": float(aggregate_score),
+            "sample_id": bucket["sample_ids"][best_index],
+            "best_sample_score": float(best_score),
+            "topk_mean_score": topk_mean,
+            "sample_count": len(scores),
+            "support_count": support,
+        })
+
+    sample_candidates.sort(key=lambda x: x["score"], reverse=True)
+    student_candidates.sort(key=lambda x: x["score"], reverse=True)
+    best = student_candidates[0]
+    second_score = float(student_candidates[1]["score"]) if len(student_candidates) > 1 else 0.0
     gap = float(best["score"] - second_score)
     matched = bool(best["score"] >= threshold and gap >= margin)
     return {
@@ -372,7 +408,13 @@ def recognize(
         "sample_id": best["sample_id"],
         "second_score": second_score,
         "margin": gap,
-        "candidates": candidates[:3],
+        "threshold": float(threshold),
+        "best_sample_score": float(best.get("best_sample_score", best["score"])),
+        "topk_mean_score": float(best.get("topk_mean_score", best["score"])),
+        "sample_count": int(best.get("sample_count", 1)),
+        "support_count": int(best.get("support_count", 1)),
+        "candidates": student_candidates[:3],
+        "sample_candidates": sample_candidates[:5],
     }
 
 

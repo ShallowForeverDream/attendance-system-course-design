@@ -10,8 +10,8 @@
 <body>
   <header class="topbar">
     <div>
-      <div class="eyebrow">Content Security Lab · BS Attendance</div>
-      <h1>班级智能考勤系统</h1>
+      <div class="eyebrow">Rhodes Tactical Terminal · Content Security Lab</div>
+      <h1>班级智能考勤系统 / FACE-CHECK OPS</h1>
     </div>
     <div class="userbox">
       <span id="currentUser">未登录</span>
@@ -47,11 +47,11 @@
     <section id="dashboard" class="tab active">
       <div class="section-head">
         <h2>系统总览</h2>
-        <p>覆盖 BS 架构、摄像头采集、动作活体、人脸库匹配、合照识别、情绪统计、权限控制与异常处理。</p>
+        <p>战术终端式 BS 架构界面：摄像头采集、动作活体、人脸库聚合匹配、合照识别、情绪统计、权限控制与异常处理。</p>
       </div>
       <div id="summaryCards" class="cards"></div>
       <div class="notice">
-        <strong>验收建议：</strong>先在“学生/人脸库”中为学生上传 3–5 张正脸样本，再进行摄像头打卡和合照识别演示。
+        <strong>验收建议：</strong>先在“学生/人脸库”中为学生上传 3–5 张不同光照/角度样本；系统会按学生聚合多样本得分，样本越充分越稳。
       </div>
     </section>
 
@@ -96,7 +96,7 @@
     <section id="students" class="tab">
       <div class="section-head">
         <h2>学生管理与人脸库</h2>
-        <p>教师可新增学生、维护人脸样本；每名学生建议至少上传 3 张不同光照/角度照片。</p>
+        <p>教师可新增学生、维护人脸样本；同一学生多张图片会聚合成学生级分数，建议至少上传 3–5 张不同光照/角度照片以提升识别鲁棒性。</p>
       </div>
       <form id="studentForm" class="student-form">
         <input name="student_no" placeholder="学号" required />

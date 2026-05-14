@@ -102,7 +102,8 @@ $('#manualCaptureBtn')?.addEventListener('click', async () => {
       `手动抓拍预检完成（不写入考勤）\n` +
       `检测人脸数：${p.face_count}，质量分：${fmt(p.quality)}\n` +
       `最佳匹配：${p.matched ? `${p.student_no} ${p.name}` : '未达到正式阈值'}\n` +
-      `人脸分：${fmt(p.score)}，第二名：${fmt(p.second_score)}，间隔：${fmt(p.score_margin)}\n` +
+      `学生聚合分：${fmt(p.score)}（阈值 ${fmt(p.threshold)}），最佳单样本：${fmt(p.best_sample_score)}，该生样本数：${p.sample_count || 0}\n` +
+      `第二名：${fmt(p.second_score)}，间隔：${fmt(p.score_margin)}\n` +
       `情绪：${p.emotion.emotion}（${fmt(p.emotion.confidence)}）\n` +
       `说明：${p.note}`;
   } catch (err) {
@@ -206,7 +207,8 @@ $('#startCheckBtn').addEventListener('click', async () => {
       `考勤状态：${r.status === 'success' ? '成功' : '失败'}\n` +
       `姓名：${r.name || '-'}\n学号：${r.student_no || '-'}\n时间：${r.time}\n` +
       `活体：${r.liveness.pass ? '通过' : '未通过'}（${r.liveness.reason}，分数 ${fmt(r.liveness.score)}）\n` +
-      `人脸匹配分：${fmt(r.face_score)}\n情绪：${r.emotion.emotion}（${fmt(r.emotion.confidence)}）\n备注：${r.note || '-'}`;
+      `人脸匹配分：${fmt(r.face_score)}（阈值 ${fmt(r.face_threshold)}，最佳单样本 ${fmt(r.best_sample_score)}，样本数 ${r.sample_count || 0}）\n` +
+      `情绪：${r.emotion.emotion}（${fmt(r.emotion.confidence)}）\n备注：${r.note || '-'}`;
     await Promise.allSettled([loadSummary(), loadRecords(), loadStats()]);
   } catch (err) {
     $('#attendanceMsg').className = 'result-box bad';
@@ -352,8 +354,8 @@ $('#groupForm').addEventListener('submit', async (e) => {
       `<div id="groupChecklist" class="check-grid"></div>` +
       `<div class="toolbar"><select id="manualStudentSelect"></select><button id="manualAddBtn" type="button">补选学生</button><button id="confirmGroupBtn" type="button">确认并写入活动频次</button></div>` +
       `<div id="confirmGroupMsg" class="small"></div></div>` +
-      `<div class="table-wrap"><table><thead><tr><th>序号</th><th>自动结果</th><th>最佳候选</th><th>状态</th><th>分数</th><th>间隔</th><th>情绪</th></tr></thead><tbody>` +
-      data.results.map(r => `<tr><td>${r.face_index}</td><td>${escapeHtml(r.matched ? groupStudentLabel(r) : '未自动确认')}</td><td>${escapeHtml(r.candidate_student_no ? `${r.candidate_student_no} ${r.candidate_name}` : '-')}</td><td>${r.matched ? '<span class="badge ok">自动确认</span>' : (r.needs_review ? '<span class="badge warn">待确认</span>' : '<span class="badge bad">未匹配</span>')}</td><td>${fmt(r.score)}</td><td>${fmt(r.score_margin)}</td><td>${escapeHtml(r.emotion)}</td></tr>`).join('') +
+      `<div class="table-wrap"><table><thead><tr><th>序号</th><th>自动结果</th><th>最佳候选</th><th>状态</th><th>聚合分</th><th>单样本/样本数</th><th>间隔</th><th>情绪</th></tr></thead><tbody>` +
+      data.results.map(r => `<tr><td>${r.face_index}</td><td>${escapeHtml(r.matched ? groupStudentLabel(r) : '未自动确认')}</td><td>${escapeHtml(r.candidate_student_no ? `${r.candidate_student_no} ${r.candidate_name}` : '-')}</td><td>${r.matched ? '<span class="badge ok">自动确认</span>' : (r.needs_review ? '<span class="badge warn">待确认</span>' : '<span class="badge bad">未匹配</span>')}</td><td>${fmt(r.score)}</td><td>${fmt(r.best_sample_score)} / ${r.sample_count || 0}</td><td>${fmt(r.score_margin)}</td><td>${escapeHtml(r.emotion)}</td></tr>`).join('') +
       `</tbody></table></div>`;
     const checklist = $('#groupChecklist');
     const addCheck = (id, label, checked, source) => {
