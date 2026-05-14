@@ -1218,6 +1218,7 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
 
     temporal_pass = not static_replay
     spoof_flash_pass = bool(not flash_check.get("enabled") or spoof_flash_face_pass)
+    flash_meta_consistent = bool(not flash_check.get("enabled") or float(flash_check.get("invalid_meta_ratio", 0.0) or 0.0) <= 0.20)
     stage_timeout_pass = all(c.get("duration_ms") is None or c.get("duration_ms", 0) <= 5500 for c in motion_checks)
     action_ratio = action_pass_count / max(len(actions), 1) if actions else (1.0 if natural_motion else 0.0)
     score = (
@@ -1229,23 +1230,36 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         + 0.10 * (1.0 if flash_check.get("pass") else 0.0)
         + 0.03 * (1.0 if stage_timeout_pass else 0.0)
     )
-    passed = bool(score >= 0.72 and motion_pass and quality_pass and temporal_pass and anti_spoof_pass and flash_check.get("pass") and spoof_flash_pass and stage_timeout_pass)
+    pass_threshold = 0.70
+    flash_soft_warning = bool(flash_check.get("enabled") and not flash_check.get("pass"))
+    # 现场普通摄像头/教室光照会把屏幕随机打光压得很弱。最终是否通过以综合活体分为准：
+    # 分数 >= 0.70 且动作、质量、时序、反照片/屏幕硬指标通过时，弱打光只作为提示记录，
+    # 但闪光元数据不一致、静态重复帧、刚性照片移动、摩尔纹/高光风险仍是一票否决。
+    passed = bool(
+        score >= pass_threshold
+        and motion_pass
+        and quality_pass
+        and temporal_pass
+        and anti_spoof_pass
+        and flash_meta_consistent
+        and stage_timeout_pass
+    )
     if passed:
-        reason = "通过"
+        reason = "通过" if not flash_soft_warning else "通过（随机打光响应偏弱，已按综合活体分通过）"
     elif static_replay:
         reason = "检测到重复静态帧，疑似照片/重放攻击"
-    elif not flash_check.get("pass"):
-        reason = flash_check.get("reason") or "随机闪光响应失败"
-    elif not spoof_flash_pass:
-        reason = "帧边缘颜色同步但人脸区域未响应本次随机闪光，疑似预录视频"
     elif rigid_planar_replay:
         reason = "归一化人脸几乎刚性不变，疑似举照片/屏幕画面移动"
     elif screen_or_print_risk:
         reason = "检测到异常高光/摩尔纹，疑似屏幕或打印件翻拍"
+    elif not flash_meta_consistent:
+        reason = "闪光元数据与服务端挑战不一致"
     elif not stage_timeout_pass:
         reason = "单组动作超过 5 秒限制"
     elif not motion_pass:
         reason = "动作不符合随机挑战"
+    elif score < pass_threshold:
+        reason = f"综合活体分不足 {pass_threshold:.2f}"
     else:
         reason = "画面质量或纹理不足"
     return {
@@ -1265,6 +1279,9 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         "avg_specular_ratio": round(float(avg_specular), 6),
         "avg_moire_score": round(float(avg_moire), 6),
         "face_color_amplitude": round(float(face_color_amp), 6),
+        "pass_threshold": round(float(pass_threshold), 4),
+        "flash_soft_warning": bool(flash_soft_warning),
+        "flash_meta_consistent": bool(flash_meta_consistent),
         "flash_challenge_pass": bool(flash_check.get("pass")),
         "spoof_flash_face_pass": bool(spoof_flash_face_pass),
         "flash_challenge": flash_check,
@@ -1277,61 +1294,143 @@ def analyze_liveness(frames: list[dict], actions: list[str] | None = None, chall
         "observations": observations[-12:],
     }
 
-def analyze_emotion(face_img: np.ndarray) -> dict:
-    if face_img is None or face_img.size == 0:
-        return {"emotion": "unknown", "confidence": 0.0}
-    eff = _emotiefflib_emotion(face_img)
-    if eff is not None:
-        return eff
-    deep = _deepface_emotion(face_img)
-    if deep is not None:
-        return deep
+def _heuristic_emotion(face_img: np.ndarray) -> dict:
+    """轻量表情兜底：用嘴部开合、眼眉暗线、对称性和亮度给出多类别结果。
 
-    # 轻量 fallback：不用重模型时仍给出多类别结果，避免旧版 neutral 一票否决导致全班同一种情绪。
+    旧版 fallback 主要按嘴部暗像素面积判断 surprise，摄像头阴影/嘴唇暗线容易让
+    所有结果都变成 surprise。这里改成“暗区纵向跨度 + 面积 + 边缘”的组合，只有
+    明显张嘴且眼口变化足够大时才给 surprise。
+    """
     gray0 = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray0, (112, 112), interpolation=cv2.INTER_AREA)
     gray = cv2.equalizeHist(gray)
-    upper = gray[:48, :]
-    eye_band = gray[20:52, :]
+    eye_band = gray[20:52, 12:100]
     middle = gray[36:76, :]
     lower = gray[62:, :]
     mouth = gray[72:104, 24:88]
-    brightness = gray0.mean() / 255.0
-    contrast = min(gray0.std() / 72.0, 1.4)
-    dark_thr = np.percentile(gray, 27)
+    brightness = float(gray0.mean() / 255.0)
+    contrast = float(min(gray0.std() / 72.0, 1.4))
+    dark_thr = float(np.percentile(gray, 24))
     mouth_dark = float((mouth < dark_thr).mean()) if mouth.size else 0.0
-    eye_dark = float((eye_band < np.percentile(gray, 24)).mean()) if eye_band.size else 0.0
-    lower_edge = cv2.Canny(lower, 70, 150).mean() / 255.0
-    mouth_edge = cv2.Canny(mouth, 55, 135).mean() / 255.0 if mouth.size else 0.0
-    mid_sym = 1.0 - np.mean(np.abs(middle[:, :56].astype(float) - np.fliplr(middle[:, 56:]).astype(float))) / 255.0
-    # 嘴角/眉眼粗略几何：用暗像素重心和边缘方向代替关键点，保证无 dlib 模型也可运行。
+    eye_dark = float((eye_band < np.percentile(gray, 22)).mean()) if eye_band.size else 0.0
+    lower_edge = float(cv2.Canny(lower, 70, 150).mean() / 255.0)
+    mouth_edge = float(cv2.Canny(mouth, 55, 135).mean() / 255.0) if mouth.size else 0.0
+    mid_sym = float(1.0 - np.mean(np.abs(middle[:, :56].astype(float) - np.fliplr(middle[:, 56:]).astype(float))) / 255.0)
+    mid_sym = max(0.0, min(1.0, mid_sym))
+
     if mouth.size:
-        ys, xs = np.where(mouth < dark_thr)
-        mouth_open = min(1.0, len(xs) / max(mouth.size * 0.18, 1))
-        mouth_center_y = float(np.mean(ys) / max(mouth.shape[0], 1)) if len(ys) else 0.5
+        local_thr = min(115.0, float(np.percentile(mouth, 30)) + 8.0)
+        dark_mask = mouth < local_thr
+        ys, xs = np.where(dark_mask)
+        if len(ys):
+            vertical_span = float((ys.max() - ys.min() + 1) / max(mouth.shape[0], 1))
+            horizontal_span = float((xs.max() - xs.min() + 1) / max(mouth.shape[1], 1))
+            mouth_center_y = float(np.mean(ys) / max(mouth.shape[0], 1))
+        else:
+            vertical_span, horizontal_span, mouth_center_y = 0.0, 0.0, 0.5
+        # 闭嘴时通常是一条横向暗线：水平跨度大但纵向跨度很小；张嘴要求纵向跨度明显。
+        mouth_open = max(0.0, (vertical_span - 0.28) * 2.00) + max(0.0, (mouth_dark - 0.20) * 1.20)
+        mouth_open *= max(0.35, min(1.0, horizontal_span + 0.10))
+        mouth_open = float(max(0.0, min(1.0, mouth_open)))
     else:
-        mouth_open, mouth_center_y = 0.0, 0.5
+        vertical_span = horizontal_span = mouth_open = 0.0
+        mouth_center_y = 0.5
+
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     brow_slope = float(np.mean(np.abs(gy[18:40, 18:94])) / (np.mean(np.abs(gx[18:40, 18:94])) + 1e-6))
+    eye_line = _closed_eye_proxy(gray0)
+    eye_open = max(0.0, 1.0 - eye_line)
 
     scores = {
-        "happy": 0.18 + 0.52 * mouth_edge + 0.36 * mouth_dark + 0.12 * brightness + 0.10 * mid_sym,
-        "surprise": 0.14 + 0.62 * mouth_open + 0.24 * eye_dark + 0.10 * lower_edge,
-        "sad": 0.16 + 0.30 * (1 - brightness) + 0.20 * eye_dark + 0.18 * max(0.0, mouth_center_y - 0.48),
-        "angry": 0.15 + 0.33 * contrast + 0.28 * eye_dark + 0.14 * min(brow_slope / 2.0, 1.0) + 0.08 * (1 - mid_sym),
-        "neutral": 0.30 + 0.20 * mid_sym + 0.10 * (1 - abs(brightness - 0.52)) + 0.08 * (1 - mouth_open),
+        "happy": 0.24 + 0.32 * mouth_edge + 0.20 * mouth_dark + 0.10 * brightness + 0.12 * mid_sym - 0.16 * mouth_open,
+        "surprise": 0.08 + 0.55 * mouth_open + 0.16 * eye_open + 0.08 * lower_edge,
+        "sad": 0.18 + 0.28 * (1 - brightness) + 0.16 * eye_dark + 0.16 * max(0.0, mouth_center_y - 0.50),
+        "angry": 0.16 + 0.28 * contrast + 0.22 * eye_dark + 0.12 * min(brow_slope / 2.0, 1.0) + 0.08 * (1 - mid_sym),
+        "neutral": 0.42 + 0.18 * mid_sym + 0.12 * (1 - abs(brightness - 0.52)) + 0.22 * (1 - mouth_open),
     }
-    best_non_neutral = max((k for k in scores if k != "neutral"), key=scores.get)
-    # 只有非中性优势非常弱时才返回 neutral，避免所有样本被默认 neutral 吸走。
-    if scores["neutral"] >= scores[best_non_neutral] + 0.08:
-        label = "neutral"
-    else:
-        label = best_non_neutral
-    total = sum(max(v, 0.0) for v in scores.values()) + 1e-6
-    conf = max(0.35, min(scores[label] / total * 2.15, 0.94))
-    return {"emotion": label, "confidence": round(float(conf), 4), "scores": {k: round(float(v), 4) for k, v in scores.items()}, "engine": "heuristic"}
+    # surprise 必须有明显张嘴；否则把“嘴唇暗线/阴影”优先解释为 neutral/happy/sad。
+    if mouth_open < 0.34:
+        scores["surprise"] *= 0.42
+    elif mouth_open < 0.50:
+        scores["surprise"] *= 0.72
+    scores = {k: max(0.0, float(v)) for k, v in scores.items()}
+    label = max(scores, key=scores.get)
+    sorted_vals = sorted(scores.values(), reverse=True)
+    total = sum(scores.values()) + 1e-6
+    margin = sorted_vals[0] - (sorted_vals[1] if len(sorted_vals) > 1 else 0.0)
+    conf = max(0.36, min(0.58 + margin / total * 1.8, 0.90))
+    return {
+        "emotion": label,
+        "confidence": round(float(conf), 4),
+        "scores": {k: round(float(v), 4) for k, v in scores.items()},
+        "engine": "heuristic",
+        "features": {
+            "mouth_open": round(float(mouth_open), 4),
+            "mouth_dark": round(float(mouth_dark), 4),
+            "mouth_vertical_span": round(float(vertical_span), 4),
+            "eye_line": round(float(eye_line), 4),
+            "brightness": round(float(brightness), 4),
+        },
+    }
 
+
+def _second_best_emotion(scores: dict, exclude: set[str] | None = None) -> tuple[str, float]:
+    exclude = exclude or set()
+    pairs = [(str(k), float(v)) for k, v in (scores or {}).items() if str(k) not in exclude]
+    if not pairs:
+        return "neutral", 0.0
+    return max(pairs, key=lambda x: x[1])
+
+
+def _stabilize_emotion(model_result: dict, heuristic: dict) -> dict:
+    """对模型结果做轻量稳定化，避免低置信 surprise 在摄像头/动作帧中一票占优。"""
+    if not model_result:
+        return heuristic
+    label = str(model_result.get("emotion") or "unknown")
+    conf = float(model_result.get("confidence", 0.0) or 0.0)
+    scores = model_result.get("scores") or {}
+    features = heuristic.get("features") or {}
+    h_label = str(heuristic.get("emotion") or "neutral")
+    h_conf = float(heuristic.get("confidence", 0.0) or 0.0)
+    mouth_open = float(features.get("mouth_open", 0.0) or 0.0)
+    vertical_span = float(features.get("mouth_vertical_span", 0.0) or 0.0)
+
+    # 现场反馈的典型问题是 surprise≈0.64 反复出现：这通常来自嘴唇暗线、张嘴动作帧或弱光，
+    # 不一定是真实“惊讶”。低置信 surprise 直接进入稳定化；中等置信但几何上不支持张嘴时也稳定化。
+    low_conf_surprise = label == "surprise" and conf < 0.70
+    weak_geometry_surprise = label == "surprise" and conf < 0.78 and (mouth_open < 0.50 or vertical_span < 0.46)
+    if low_conf_surprise or weak_geometry_surprise:
+        second_label, second_score = _second_best_emotion(scores, {"surprise"})
+        if h_label != "surprise" and h_conf >= 0.45:
+            guarded = dict(heuristic)
+            guarded["engine"] = f"{model_result.get('engine', 'model')}+heuristic_guard"
+            guarded["model_emotion"] = label
+            guarded["model_confidence"] = round(conf, 4)
+            guarded["model_scores"] = scores
+            return guarded
+        if second_score >= 0.12:
+            guarded = dict(model_result)
+            guarded["emotion"] = second_label
+            guarded["confidence"] = round(float(max(second_score, 0.42)), 4)
+            guarded["engine"] = f"{model_result.get('engine', 'model')}+second_choice_guard"
+            guarded["model_emotion"] = label
+            guarded["model_confidence"] = round(conf, 4)
+            return guarded
+    return model_result
+
+
+def analyze_emotion(face_img: np.ndarray) -> dict:
+    if face_img is None or face_img.size == 0:
+        return {"emotion": "unknown", "confidence": 0.0}
+    heuristic = _heuristic_emotion(face_img)
+    eff = _emotiefflib_emotion(face_img)
+    if eff is not None:
+        return _stabilize_emotion(eff, heuristic)
+    deep = _deepface_emotion(face_img)
+    if deep is not None:
+        return _stabilize_emotion(deep, heuristic)
+    return heuristic
 
 def annotate_group_image(img: np.ndarray, results: list[dict]) -> Path:
     canvas = img.copy()
