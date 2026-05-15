@@ -114,6 +114,18 @@
         </form>
         <div id="bulkFaceImportMsg" class="small"></div>
       </details>
+      <div id="bulkFaceImportOverlay" class="modal hidden" aria-hidden="true">
+        <div class="modal-card bulk-import-modal">
+          <div class="section-head compact">
+            <div>
+              <h3>批量导入结果</h3>
+              <p>这里显示成功、失败清单，方便现场检查导入是否完全正确。</p>
+            </div>
+            <button id="closeBulkFaceImportOverlay" class="ghost" type="button">关闭</button>
+          </div>
+          <div id="bulkFaceImportResult"></div>
+        </div>
+      </div>
       <details class="subpanel">
         <summary>批量导入学生（JSON）</summary>
         <p class="small">格式示例：<code>[{"student_no":"20260003","name":"王五","class_name":"内容安全实践班"}]</code></p>

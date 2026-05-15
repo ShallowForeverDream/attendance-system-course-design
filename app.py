@@ -523,7 +523,7 @@ def create_app() -> Flask:
                 "errors": errors[:10],
             })
         return jsonify({
-            "ok": bool(added_samples),
+            "ok": True,
             "students_added": added_students,
             "students_updated": updated_students,
             "samples_added": len(added_samples),

@@ -29,6 +29,36 @@ function emotionText(emotion) {
   const guarded = emotion.model_emotion ? `，原始=${emotion.model_emotion}/${fmt(emotion.model_confidence)}` : '';
   return `${emotion.emotion || 'unknown'}（${fmt(emotion.confidence)}，engine=${engine}${model}${guarded}）`;
 }
+function openBulkFaceImportOverlay(res) {
+  const overlay = $('#bulkFaceImportOverlay');
+  const box = $('#bulkFaceImportResult');
+  const successItems = (res.added || []).map(x => `<li class="good">${escapeHtml(x.file)} → ${escapeHtml(x.student_no)} ${escapeHtml(x.name)} · 质量 ${fmt(x.quality)}</li>`).join('');
+  const errorItems = (res.errors || []).map(x => `<li class="bad">${escapeHtml(x.file || '-')}${x.student_no ? ` → ${escapeHtml(x.student_no)} ${escapeHtml(x.name || '')}` : ''}：${escapeHtml(x.error)}</li>`).join('');
+  box.innerHTML = `
+    <div class="import-summary">
+      <div class="card"><div class="num">${res.students_added || 0}</div><div class="label">新增学生</div></div>
+      <div class="card"><div class="num">${res.students_updated || 0}</div><div class="label">更新学生</div></div>
+      <div class="card"><div class="num">${res.samples_added || 0}</div><div class="label">新增样本</div></div>
+    </div>
+    <div class="import-grid">
+      <div class="import-list">
+        <h4>成功清单（${(res.added || []).length}）</h4>
+        ${successItems ? `<ul>${successItems}</ul>` : '<p class="small">无成功记录</p>'}
+      </div>
+      <div class="import-list">
+        <h4>失败清单（${(res.errors || []).length}）</h4>
+        ${errorItems ? `<ul>${errorItems}</ul>` : '<p class="small">无失败记录</p>'}
+      </div>
+    </div>`;
+  show(overlay, true);
+  overlay.setAttribute('aria-hidden', 'false');
+}
+function closeBulkFaceImportOverlay() {
+  const overlay = $('#bulkFaceImportOverlay');
+  if (!overlay) return;
+  show(overlay, false);
+  overlay.setAttribute('aria-hidden', 'true');
+}
 
 async function refreshMe() {
   const data = await api('/api/me');
@@ -411,13 +441,17 @@ $('#bulkFaceImportForm')?.addEventListener('submit', async (e) => {
   msg.textContent = '正在批量导入人脸图片，请稍候...';
   try {
     const res = await api('/api/students/faces/bulk', {method: 'POST', body: new FormData(e.currentTarget)});
-    msg.textContent =
-      `导入完成：新增学生 ${res.students_added}，更新学生 ${res.students_updated}，新增样本 ${res.samples_added}，失败 ${res.errors.length}` +
-      (res.errors.length ? `\n失败明细：\n${res.errors.slice(0, 12).map(x => `${x.file}: ${x.error}`).join('\n')}` : '');
+    msg.textContent = `导入完成：新增学生 ${res.students_added}，更新学生 ${res.students_updated}，新增样本 ${res.samples_added}，失败 ${res.errors.length}`;
+    openBulkFaceImportOverlay(res);
     await Promise.all([loadStudents(), loadSummary(), loadScorecard()]);
   } catch (err) {
     msg.textContent = '批量导入失败：' + err.message;
   }
+});
+
+$('#closeBulkFaceImportOverlay')?.addEventListener('click', closeBulkFaceImportOverlay);
+$('#bulkFaceImportOverlay')?.addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeBulkFaceImportOverlay();
 });
 
 $('#addFaceFromCameraBtn')?.addEventListener('click', async () => {
