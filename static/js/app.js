@@ -257,6 +257,7 @@ $('#startCheckBtn').addEventListener('click', async () => {
   await startCamera();
   $('#attendanceMsg').className = 'result-box';
   try {
+    $('#challengeSteps').innerHTML = '';
     const challenge = (await api('/api/attendance/challenge')).challenge;
     const stepsEl = $('#challengeSteps');
     stepsEl.innerHTML = challenge.steps.map(s =>

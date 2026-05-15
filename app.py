@@ -534,6 +534,8 @@ def create_app() -> Flask:
     @app.get("/api/attendance/challenge")
     @require_login
     def attendance_challenge():
+        # 如果上一次挑战还没完成，新的“开始活体打卡”会直接覆盖旧会话并重新开始。
+        session.pop("attendance_challenge", None)
         actions = random.sample(LIVENESS_ACTION_POOL, LIVENESS_GROUP_COUNT)
         # 保证正式活体每次至少包含一组随机打光挑战，方便现场稳定展示抗预录视频能力；
         # 其它两组仍从动作池中随机抽取，满足“三组随机单动作”要求。
