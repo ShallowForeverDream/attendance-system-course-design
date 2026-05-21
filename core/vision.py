@@ -1773,11 +1773,35 @@ def detect_demo_collage_all_tiles(img: np.ndarray, samples: list[dict]) -> list[
                 student = report_students[pos] if pos < len(report_students) else None
             if not student:
                 continue
-            margin_x = int(tile_w * 0.16)
-            margin_y = int(tile_h * 0.12)
-            face_size = int(min(tile_w * 0.68, tile_h * 0.58))
+            # 旧版/新版演示拼图都是“卡片上半部分为人脸、下半部分为学号姓名”。
+            # 之前直接用 tile 的近似中心框会把背景/衣服/标签带入特征，导致显示分数
+            # 从 0.90+ 降到 0.60~0.80。这里在每个 tile 的图片区内再跑一次 Haar，
+            # 用更紧的人脸框参与后续 embedding/score 展示；失败时才使用保守近似框。
+            tx1, tx2 = int(c * tile_w), int((c + 1) * tile_w)
+            ty1, ty2 = int(r * tile_h), int((r + 1) * tile_h)
+            face_roi_y2 = int(ty1 + tile_h * 0.76)
+            tile_img = img[max(0, ty1):min(h, face_roi_y2), max(0, tx1):min(w, tx2)]
+            local_faces = detect_faces(tile_img, min_size=max(36, int(min(tile_w, tile_h) * 0.16))) if tile_img.size else []
+            if local_faces:
+                best = local_faces[0]
+                box = FaceBox(tx1 + best.x, ty1 + best.y, best.w, best.h, best.quality)
+            else:
+                margin_x = int(tile_w * 0.16)
+                margin_y = int(tile_h * 0.12)
+                face_size = int(min(tile_w * 0.68, tile_h * 0.58))
+                box = FaceBox(x1 + margin_x, int(r * tile_h) + margin_y, face_size, face_size, 1.0)
+            feature_margin = 28
+            feature_size = int(max(32, min(tile_w - feature_margin * 2, tile_h - feature_margin * 2 - 64)))
+            feature_box = FaceBox(
+                max(0, tx1 + feature_margin),
+                max(0, ty1 + feature_margin),
+                min(feature_size, w - (tx1 + feature_margin)),
+                min(feature_size, h - (ty1 + feature_margin)),
+                1.0,
+            )
             out.append({
                 "student": student,
-                "box": FaceBox(x1 + margin_x, int(r * tile_h) + margin_y, face_size, face_size, 1.0),
+                "box": box,
+                "feature_box": feature_box,
             })
     return out

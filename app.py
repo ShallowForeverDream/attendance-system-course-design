@@ -1095,12 +1095,22 @@ def create_app() -> Flask:
             if len(demo_tiles) >= len(faces) and demo_tiles:
                 faces = [t["box"] for t in demo_tiles]
                 demo_tile_students = {i: t["student"] for i, t in enumerate(demo_tiles, start=1)}
+                demo_tile_feature_boxes = {i: t.get("feature_box") or t["box"] for i, t in enumerate(demo_tiles, start=1)}
             else:
                 demo_tile_students = {}
+                demo_tile_feature_boxes = {}
             demo_layout_students = detect_demo_collage_layout_students(img, samples)
             for idx, box in enumerate(faces, start=1):
                 face_crop = crop_face(img, box)
-                emb = face_embedding(face_crop)
+                feature_box = demo_tile_feature_boxes.get(idx)
+                if feature_box:
+                    fx, fy, fw, fh = feature_box.x, feature_box.y, feature_box.w, feature_box.h
+                    feature_crop = img[max(0, fy):max(0, fy) + max(1, fh), max(0, fx):max(0, fx) + max(1, fw)]
+                    if feature_crop.size == 0:
+                        feature_crop = face_crop
+                else:
+                    feature_crop = face_crop
+                emb = face_embedding(feature_crop)
                 match = recognize(emb, samples, threshold=auto_threshold, margin=0.03)
                 best = match.get("student")
                 auto_student = best if match.get("matched") else None
