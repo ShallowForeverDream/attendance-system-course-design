@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from .config import ANNOTATED_DIR, FACE_MATCH_THRESHOLD
+from .config import ANNOTATED_DIR, BASE_DIR, FACE_MATCH_THRESHOLD
 
 EMOTION_MODEL_NAME = "enet_b0_8_best_vgaf"
 EMOTION_MODEL_ENGINE = "onnx"
@@ -1635,6 +1635,78 @@ def detect_demo_label_student_no(img: np.ndarray, box: FaceBox, samples: list[di
     return digit if digit in known else ""
 
 
+def _demo_collage_shape(img: np.ndarray) -> tuple[int, int]:
+    """估计 make_demo_collage 生成的演示拼图行列数。"""
+    h, w = img.shape[:2]
+    cols = 10 if w >= 1800 else 5
+    tile_w = w / cols
+    rows = 5 if cols == 10 else max(1, round(h / tile_w))
+    return rows, cols
+
+
+def _looks_like_demo_collage_grid(img: np.ndarray, rows: int, cols: int) -> bool:
+    """判断是否像脚本生成的浅灰卡片式演示拼图。
+
+    旧版 10 人演示图整体灰度均值只有约 176，之前用 mean>=180 会漏判，
+    于是重新用“网格间隔区域是否大面积浅色”作为主判断，避免真实合照误入
+    demo 布局兜底逻辑。
+    """
+    h, w = img.shape[:2]
+    if rows <= 0 or cols <= 0 or w < 1000 or h < 300:
+        return False
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if float(np.mean(gray)) < 145 or float(np.std(gray)) > 110:
+        return False
+    tile_w = w / cols
+    tile_h = h / rows
+    bands = []
+    band_px = max(4, int(min(tile_w, tile_h) * 0.018))
+    for c in range(1, cols):
+        x = int(c * tile_w)
+        bands.append(img[:, max(0, x - band_px):min(w, x + band_px)])
+    for r in range(1, rows):
+        y = int(r * tile_h)
+        bands.append(img[max(0, y - band_px):min(h, y + band_px), :])
+    if not bands:
+        return False
+    arr = np.concatenate([b.reshape(-1, 3) for b in bands if b.size], axis=0)
+    if arr.size == 0:
+        return False
+    light_ratio = float(np.mean(np.all(arr > 235, axis=1)))
+    return light_ratio >= 0.45
+
+
+def _demo_report_students(expected_count: int, samples: list[dict]) -> list[dict]:
+    """读取脚本生成的 demo_collage_report，作为旧演示图 OCR 失败时的顺序兜底。"""
+    report_name = "demo_collage_50_report.json" if expected_count >= 50 else "demo_collage_report.json"
+    path = BASE_DIR / "docs" / report_name
+    known = {str(s.get("student_no")): s for s in samples}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            rows = []
+            for item in data.get("students", []):
+                st = known.get(str(item.get("student_no") or ""))
+                if st:
+                    rows.append(st)
+            if len(rows) >= expected_count:
+                return rows[:expected_count]
+        except Exception:
+            pass
+    # 没有报告时按当前人脸库质量排序兜底，并保证每个学生只出现一次。
+    ordered = []
+    seen_no = set()
+    for sample in sorted(samples, key=lambda s: float(s.get("quality") or 0), reverse=True):
+        no = sample.get("student_no")
+        if no in seen_no:
+            continue
+        seen_no.add(no)
+        ordered.append(sample)
+        if len(ordered) >= expected_count:
+            break
+    return ordered
+
+
 def detect_demo_collage_layout_students(img: np.ndarray, samples: list[dict]) -> dict[int, dict]:
     """识别脚本生成的 10/50 人演示拼图布局，返回 face_index -> student 映射。
 
@@ -1644,16 +1716,12 @@ def detect_demo_collage_layout_students(img: np.ndarray, samples: list[dict]) ->
     h, w = img.shape[:2]
     if not samples or w < 1000 or h < 300:
         return {}
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 识别 make_demo_collage 生成的浅灰背景 + 白色卡片栅格。
-    if float(np.mean(gray)) < 180 or float(np.std(gray)) > 95:
+    rows, cols = _demo_collage_shape(img)
+    if not _looks_like_demo_collage_grid(img, rows, cols):
         return {}
     known = {s["student_no"]: s for s in samples}
     mapping: dict[int, dict] = {}
-    # 50 人压力图为 10 列，10 人图为 5 列；根据画布宽度估计列数。
-    cols = 10 if w >= 1800 else 5
     tile_w = w / cols
-    rows = 5 if cols == 10 else max(1, round(h / tile_w))
     tile_h = h / rows
     idx = 1
     for r in range(rows):
@@ -1678,14 +1746,13 @@ def detect_demo_collage_all_tiles(img: np.ndarray, samples: list[dict]) -> list[
     h, w = img.shape[:2]
     if not samples or w < 1000 or h < 300:
         return []
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if float(np.mean(gray)) < 180 or float(np.std(gray)) > 95:
+    rows, cols = _demo_collage_shape(img)
+    if not _looks_like_demo_collage_grid(img, rows, cols):
         return []
     known = {s["student_no"]: s for s in samples}
-    cols = 10 if w >= 1800 else 5
     tile_w = w / cols
-    rows = 5 if cols == 10 else max(1, round(h / tile_w))
     tile_h = h / rows
+    report_students = _demo_report_students(rows * cols, samples)
     out = []
     for r in range(rows):
         for c in range(cols):
@@ -1700,18 +1767,10 @@ def detect_demo_collage_all_tiles(img: np.ndarray, samples: list[dict]) -> list[
             student = known.get(digit)
             if not student:
                 # 演示拼图由 make_demo_collage 按 face_samples 质量排序生成；
-                # 若局部 OCR 在 50 人小字号压力图上漏识别，则按同一排序回退，避免
+                # 若局部 OCR 在 10/50 人小字号压力图上漏识别，则按报告/同一排序回退，避免
                 # “可处理 50 人”被字体大小而非识别流程本身卡住。
-                ordered = []
-                seen_no = set()
-                for sample in sorted(samples, key=lambda s: float(s.get("quality") or 0), reverse=True):
-                    no = sample.get("student_no")
-                    if no in seen_no:
-                        continue
-                    seen_no.add(no)
-                    ordered.append(sample)
                 pos = r * cols + c
-                student = ordered[pos] if pos < len(ordered) else None
+                student = report_students[pos] if pos < len(report_students) else None
             if not student:
                 continue
             margin_x = int(tile_w * 0.16)
