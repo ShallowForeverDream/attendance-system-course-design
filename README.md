@@ -53,6 +53,8 @@ python app.py
 9. 使用学生账号登录，验证只能查看本人数据。
 10. 打开“验收清单”，逐项展示每个得分点。
 
+创新点和难点建议按 `docs/创新点与难点验收清单.md` 逐项验收，包括分阶段即时活体、动作随机 + 闪光随机、多样本学生级聚合、合照教师确认闭环、情绪模型诊断、批量导入错误清单、安全自测脚本和 storage 权限保护。
+
 ## 4. 功能与评分点对应
 
 | 评分点 | 项目实现 |
@@ -124,6 +126,8 @@ attendance_system/
 python scripts\prepare_demo.py
 python -m compileall .
 python scripts\liveness_stage_selftest.py
+python scripts\liveness_antispoof_selftest.py
+python scripts\emotion_selftest.py
 python scripts\smoke_test.py
 python scripts\group_collage_selftest.py
 python scripts\group_collage_50_selftest.py
@@ -139,4 +143,6 @@ python app.py
 - `docs/demo_collage_50_report.json`：50 人压力合照名单；
 - `docs/group_collage_selftest_report.json`：合照接口自测准确率；
 - `docs/group_collage_50_selftest_report.json`：50 人合照压力测试结果；
-- `docs/现场验收展示清单.md`：现场逐分展示路线。
+- `docs/现场验收展示清单.md`：现场逐分展示路线；
+- `docs/创新点与难点验收清单.md`：创新点/难点逐项验收路线；
+- `docs/考勤系统实验报告.docx`：正式实验报告。

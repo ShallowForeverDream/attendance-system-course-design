@@ -15,11 +15,10 @@ from scripts.make_demo_collage import make_collage  # noqa: E402
 def main() -> None:
     docs = ROOT / "docs"
     report_path = docs / "demo_collage_50_report.json"
-    if report_path.exists():
-        collage = json.loads(report_path.read_text(encoding="utf-8"))
-    else:
-        collage = make_collage(count=50, size=180, output_name="demo_collage_50_pressure.png")
-        report_path.write_text(json.dumps(collage, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 每次自测都重新生成 50 人压力图，避免本地数据库新增/删除样本后继续使用旧
+    # demo_collage_50_report.json 导致“图片标签”和“当前人脸库排序”不一致。
+    collage = make_collage(count=50, size=180, output_name="demo_collage_50_pressure.png")
+    report_path.write_text(json.dumps(collage, ensure_ascii=False, indent=2), encoding="utf-8")
     image_path = BASE_DIR / collage["image_path"]
     client = app.test_client()
     r = client.post("/api/login", json={"username": "teacher", "password": "teacher123"})

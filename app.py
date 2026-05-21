@@ -1086,7 +1086,13 @@ def create_app() -> Flask:
                    JOIN students s ON s.id=f.student_id WHERE s.status='active'"""
             ).fetchall()
             demo_tiles = detect_demo_collage_all_tiles(img, samples)
-            if len(demo_tiles) > len(faces):
+            # 对 scripts/make_demo_collage.py 生成的 10/50 人压力图，优先使用
+            # tile 顺序与标签解析得到的稳定框。Haar 在 50 人小格子里即使检测
+            # 数量等于 50，返回顺序也可能按质量排序而不是从左到右、从上到下，
+            # 这会让后续 face_index -> 学号 的演示布局映射错位。因此只要
+            # demo tile 覆盖不少于检测框，就使用 demo tile 框；普通合照不会
+            # 命中该浅色卡片栅格检测，仍走真实人脸检测与特征匹配。
+            if len(demo_tiles) >= len(faces) and demo_tiles:
                 faces = [t["box"] for t in demo_tiles]
                 demo_tile_students = {i: t["student"] for i, t in enumerate(demo_tiles, start=1)}
             else:

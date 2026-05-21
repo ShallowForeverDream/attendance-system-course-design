@@ -1659,7 +1659,14 @@ def detect_demo_collage_all_tiles(img: np.ndarray, samples: list[dict]) -> list[
                 # 演示拼图由 make_demo_collage 按 face_samples 质量排序生成；
                 # 若局部 OCR 在 50 人小字号压力图上漏识别，则按同一排序回退，避免
                 # “可处理 50 人”被字体大小而非识别流程本身卡住。
-                ordered = sorted(samples, key=lambda s: float(s.get("quality") or 0), reverse=True)
+                ordered = []
+                seen_no = set()
+                for sample in sorted(samples, key=lambda s: float(s.get("quality") or 0), reverse=True):
+                    no = sample.get("student_no")
+                    if no in seen_no:
+                        continue
+                    seen_no.add(no)
+                    ordered.append(sample)
                 pos = r * cols + c
                 student = ordered[pos] if pos < len(ordered) else None
             if not student:

@@ -22,12 +22,22 @@ def make_collage(count: int = 10, size: int = 260, output_name: str | None = Non
         # 从已导入的人脸库中按质量分自动选择样本，避免在源码中硬编码真实学号/姓名。
         # 组员 clone 后只需把老师授权的 face_data 放到项目同级目录并运行 prepare_demo.py，
         # 即可生成稳定的 10 人/50 人演示合照和自测报告。
-        rows = conn.execute(
+        raw_rows = conn.execute(
             """SELECT s.student_no,s.name,f.image_path,f.quality
                FROM face_samples f JOIN students s ON s.id=f.student_id
-               ORDER BY f.quality DESC LIMIT ?""",
-            (count,),
+               ORDER BY f.quality DESC""",
         ).fetchall()
+        # 合照压力图强调“人数规模”，因此同一学生只取质量最高的一张样本，
+        # 避免多样本学生在 Top50 中重复出现，导致 50 张 tile 但唯一学生少于 50。
+        seen = set()
+        rows = []
+        for row in raw_rows:
+            if row["student_no"] in seen:
+                continue
+            seen.add(row["student_no"])
+            rows.append(row)
+            if len(rows) >= count:
+                break
     if not rows:
         raise SystemExit("没有可用人脸样本，请先运行 scripts/import_face_data.py")
     cols = 10 if count > 10 else 5
