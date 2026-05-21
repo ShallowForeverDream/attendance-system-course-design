@@ -8,12 +8,13 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .config import ANNOTATED_DIR, FACE_MATCH_THRESHOLD
 
@@ -1495,6 +1496,34 @@ def analyze_emotion(face_img: np.ndarray) -> dict:
         return _stabilize_emotion(deep, heuristic)
     return heuristic
 
+@lru_cache(maxsize=8)
+def _load_cjk_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """加载可绘制中文的字体，避免 OpenCV putText 把姓名画成 ?????。"""
+    candidates = [
+        "C:/Windows/Fonts/msyh.ttc",      # Microsoft YaHei
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ]
+    for fp in candidates:
+        if Path(fp).exists():
+            return ImageFont.truetype(fp, size)
+    return ImageFont.load_default()
+
+
+def _draw_label_with_outline(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+) -> None:
+    draw.text(xy, text, font=font, fill=fill, stroke_width=2, stroke_fill=(245, 245, 245))
+
+
 def annotate_group_image(img: np.ndarray, results: list[dict]) -> Path:
     canvas = img.copy()
     for r in results:
@@ -1502,11 +1531,25 @@ def annotate_group_image(img: np.ndarray, results: list[dict]) -> Path:
         ok = r.get("matched")
         color = (50, 190, 80) if ok else (0, 150, 255)
         cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 2)
+
+    # cv2.putText 只能可靠绘制 ASCII；中文姓名会变成 ?????。
+    # 因此检测框继续用 OpenCV，文字统一转 PIL + 中文字体绘制。
+    pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    for r in results:
+        x, y, w, h = r["box"]
+        ok = r.get("matched")
+        color_bgr = (50, 190, 80) if ok else (0, 150, 255)
+        color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+        font_size = max(14, min(22, int(max(w, h) * 0.12)))
+        font = _load_cjk_font(font_size)
+        small_font = _load_cjk_font(max(13, font_size - 2))
         label = r.get("name") or "unknown"
         label += f" {r.get('score', 0):.2f}"
-        cv2.putText(canvas, label, (x, max(22, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA)
+        _draw_label_with_outline(draw, (x, max(0, y - font_size - 6)), label, font, color_rgb)
         if r.get("emotion"):
-            cv2.putText(canvas, r["emotion"], (x, y + h + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+            _draw_label_with_outline(draw, (x, y + h + 2), str(r["emotion"]), small_font, color_rgb)
+    canvas = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
     return save_image(canvas, ANNOTATED_DIR, prefix="annotated")
 
 
